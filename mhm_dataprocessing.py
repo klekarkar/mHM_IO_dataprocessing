@@ -1,5 +1,6 @@
 import pandas as pd
 import xarray as xr
+from xarray import DataArray
 import numpy as np
 import geopandas as gpd
 import rioxarray as rio
@@ -69,3 +70,41 @@ def compute_optimal_h(data, bandwidths):
     # Optimal bandwidth
     optimal_h = grid.best_params_['bandwidth']
     return optimal_h
+
+
+#>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+def compute_standardized_anomaly(ds: DataArray, freq) -> DataArray:
+    """
+    Compute the standardized anomaly of a DataArray.
+    The standardized anomaly of each month with respect to all the corresponding months in the time series.
+    For each month, the standardized anomaly is calculated as the anomaly divided by the standard deviation of the anomaly.
+    Parameters
+    ----------
+    ds : DataArray
+        The input rainfall data. At daily temporal scale.
+    freq: string
+        The frequency of target resampled data. 'M'/'ME' for monthly
+    Returns
+    -------
+    DataArray
+        The standardized anomaly.
+    """
+    # Step 1: Compute monthly total rainfall
+    monthly_mean = ds.resample(time=freq).sum('time')
+
+    # Step 2: Compute mean of each month across all years
+    monthly_mean_grouped = monthly_mean.groupby('time.month').mean()
+
+     # Step 3: Compute monthly anomalies
+    # vectorized more efficient method
+    ds_anomalies = monthly_mean.groupby('time.month') - monthly_mean_grouped
+
+    # Step 4: Calculate the standard deviation of the anomalies for each month
+    # Group anomalies by month and compute standard deviation over the time dimension
+    anomalies_stdev_monthly = ds_anomalies.groupby('time.month').std()
+    
+    #compute the standardized monthly anomalies
+    #Divide each monthly anomaly by the standard deviation of the corresponding month to get the standardized anomalies.
+    standardized_anomalies = ds_anomalies.groupby('time.month') / anomalies_stdev_monthly
+
+    return standardized_anomalies
