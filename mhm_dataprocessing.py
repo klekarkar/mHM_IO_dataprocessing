@@ -59,7 +59,8 @@ def compute_optimal_h(data, bandwidths):
     optimal_h : float
         Optimal bandwidth for the kernel density estimate
     """
-    # Define a range of bandwidths to test e.g. bandwidths = np.linspace(0.001, 0.9, 500)
+    # Define a range of bandwidths to test 
+    # e.g. bandwidths = np.linspace(0.001, 0.9, 500)
 
     # Perform cross-validated grid search for bandwidth h
     grid = GridSearchCV(KernelDensity(kernel='gaussian'),
