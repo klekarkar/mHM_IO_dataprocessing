@@ -7,7 +7,7 @@ Use remapbil: https://code.mpimet.mpg.de/boards/2/topics/96
 The xfirst and yfirst values are grid centres.
 To ensure that the origins of the files match the xllcorner and yllcorner values of the morph files, add half a cell size to xll and yll corners so that if yllcorner is 49.5 and xllcorner is 2.5, then yfirst should be 49.5+0.03125/2 = 49.515625 and xfirst = 2.515625.
 
-cat > domain_grid << EOF
+cat > meteo_domain_grid << EOF
 gridtype = lonlat
 xsize    = 128
 ysize    = 64
