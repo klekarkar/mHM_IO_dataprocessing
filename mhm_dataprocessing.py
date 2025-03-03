@@ -163,3 +163,146 @@ def group_weekly(dataset):
     weekly_ds = xr.concat(weekly_means, dim="time")
 
     return weekly_ds
+
+#==>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+# For each var, extract the soil moisture content, field capacity, and wilting point at L1
+def calculate_paw_smi(mhm_fluxes, soil_hydr_grid, sm_var, nhorizon):
+    """
+    Calculate the standardised plant available water (PAW) according to the European Drought Observatory (EDO)
+    
+    Parameters
+    ----------
+    mhm_fluxes : xarray.Dataset
+        The mHM dataset containing the soil moisture content at L1
+    
+    soil_hydr_grid : xarray.Dataset
+        The mHM dataset containing the soil hydraulic properties: field capacity and wilting point
+
+    var : str
+        The variable name of the soil moisture content at L1 (e.g. 'SWC_L01')
+    nhorizon : int
+        The horizon being considered (e.g. 0, 1, 2, ...)
+        The horizon number must correpsond to the sm var being use.
+        SWC_L01 corresponds to horizon 0, SWC_L02 corresponds to horizon 1, SWC_L0n corresponds to horizon n-1
+
+    Returns
+    -------
+    smi_EDO : xarray.DataArray
+        The standardised soil moisture index according to the European Drought Observatory
+    
+    """
+    # Select the soil moisture content at L1
+    sm_vars = [sm_var for sm_var in mhm_fluxes.variables if 'SWC_L0' in sm_var]
+    
+    swc = mhm_fluxes[[sm_var]] 
+    if sm_var not in sm_vars:
+        raise ValueError(f"Variable {sm_var} not found in the mHM dataset. Please select one of the following: {sm_vars}")
+    
+    # Group the data into weekly averages
+    swc_weekly = group_weekly(swc)
+
+    # Select soil field capacity and wilting point at L1
+    soil_water_limits = soil_hydr_grid[['L1_soilMoistFC', 'L1_wiltingPoint']].isel(
+        L1_LandCoverPeriods=0,  # Remains fixed since there is only one land cover period
+        L1_SoilHorizons= nhorizon      # Can be changed to the number of horizons in the mHM model
+    ).assign_coords(
+        lat=(("lon", "lat"), soil_hydr_grid['L1_domain_lat'].values),
+        lon=(("lon", "lat"), soil_hydr_grid['L1_domain_lon'].values)
+    )
+    
+    #check if nhorizon is 1 less than the last digit of the var
+    if nhorizon != int(sm_var[-1]) - 1:
+        raise ValueError(f"Horizon {nhorizon} does not correspond to variable {sm_var}. Please select the correct horizon.")
+
+    # Rename nrows1 and ncols1 to lat and lon
+    soil_water_limits = soil_water_limits.rename({'ncols1': 'lon', 'nrows1': 'lat'})
+
+    #Extract Field capacity and wilting point as arrays and assign the dims of swc
+    fc_array = soil_water_limits['L1_soilMoistFC'].values
+    wp_array = soil_water_limits['L1_wiltingPoint'].values
+
+    # Create DataArray for field capacity
+    fc_da = xr.DataArray(fc_array, dims=('lat', 'lon'), coords={'lat': swc['lat'], 'lon': swc['lon']})
+
+    # Create DataArray for wilting point
+    wp_da = xr.DataArray(wp_array, dims=('lat', 'lon'), coords={'lat': swc['lat'], 'lon': swc['lon']})
+
+    # Calculate mean of FC and wilting point
+    theta_50 = (fc_da + wp_da) / 2
+
+    # Calculate plant available water (paw)
+    #paw = soil_water_limits['L1_soilMoistFC'] - soil_water_limits['L1_wiltingPoint']
+
+    #Calculate Weekly plant available water (paw) scaled to 0-1
+    paw_scaled = (swc_weekly - wp_da) / (fc_da - wp_da)
+
+     # Calculate the weekly EDO SMI (According to European Drought Observatory)
+    smi_EDO = 1 - 1/(1 +(swc_weekly/theta_50)**6)
+
+    # Return both smi_EDO and paw_scaled in a dictionary
+    return {
+        'smi_EDO': smi_EDO,
+        'paw_scaled': paw_scaled
+    }
+
+    #Example usage:
+    # to access each of the returned values, use the following syntax:
+    #result = calculate_paw_smi(mhm_fluxes, soil_hydr_grid, 'SWC_L01', 0)
+    #smi_EDO = result['smi_EDO']
+    #paw_scaled = result['paw_scaled']
+
+
+#==>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+def calculate_sma(smi_EDO, reference_period, target_date):
+    """
+    Calculate the Soil Moisture Anomaly (SMA) for a particular (week, year) pair
+    based on the corresponding week in the reference period of choice.
+
+    Parameters
+    ----------
+    smi_EDO : xarray.DataArray
+        The standardised soil moisture index according to the European Drought Observatory
+    reference_period : tuple
+        A tuple of two datetime objects representing the start and end of the reference period
+        e.g. ('1996-01-01', '2016-12-31'). Must include the brackets.
+    target_date : str
+        A string representing the target date in the format 'mm/dd/yyyy' e.g. '01/15/1997'
+
+    Returns
+    -------
+    sma : xarray.DataArray
+        The soil moisture anomaly for the target date based on the reference period
+
+    """
+    #Calculate the weekly Soil Moisture Anomaly (SMA)
+    #Reference period 1996-2016
+    ref_data = smi_EDO.sel(time=slice(reference_period))
+
+    #Calculate the mean for each week of the reference period
+    ref_mean_weekly = ref_data.groupby('week').mean(dim='time')
+    #Calculate the standard deviation for each week of the reference period
+    ref_std_weekly = ref_data.groupby('week').std(dim='time')
+    
+    #Calculate the SMA
+    #select a particular week and year after the reference period
+    
+    target_datetime = pd.to_datetime(target_date)
+    target_week = (target_datetime.dayofyear - 1) // 7
+    target_year = target_datetime.year
+
+    # Filter for year = 1997, dropping everything else
+    yeardata = smi_EDO.sel(time=smi_EDO['time'].dt.year == target_year)
+    # Now filter for the target week, dropping everything else
+    weekdata = yeardata.where(yeardata['week'] == target_week, drop=True)
+    #SMA = (SWC - mean) / std
+    weekly_sma = (weekdata - ref_mean_weekly.sel(week=target_week)) / ref_std_weekly.sel(week=target_week)
+
+    return weekly_sma
+
+#Example usage:
+#result = calculate_paw_smi('SWC_L01', 0)
+#smi_EDO = result['smi_EDO']
+#paw_scaled = result['paw_scaled']
+#calculate_sma(smi_EDO, ('1996-01-01', '2016-12-31'), '01/15/1997')
