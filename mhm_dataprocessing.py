@@ -306,3 +306,69 @@ def calculate_sma(smi_EDO, reference_period, target_date):
 #smi_EDO = result['smi_EDO']
 #paw_scaled = result['paw_scaled']
 #calculate_sma(smi_EDO, ('1996-01-01', '2016-12-31'), '01/15/1997')
+
+
+#>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+def extract_seasonal_totals(ds):
+    """
+    Compute the seasonal totals of a given DataArray.
+    The seasonal totals are computed for each meteorological season (DJF, MAM, JJA, SON).
+
+    Parameters
+    ----------
+    ds : DataArray
+        The input data array.
+
+    Returns
+    -------
+    seasonal_totals : dict
+        A dictionary containing the seasonal totals for each meteorological season, averaged over all years.
+    """
+
+    seasonal_totals = {}
+    DJF_totals, MAM_totals, JJA_totals, SON_totals = [], [], [], []
+
+    # Group by meteorological seasons (DJF, MAM, JJA, SON)
+    for year in np.unique(ds.time.dt.year):
+        # DJF: December, January, February (December of the current year, January and February of the next year)
+        if (year % 4 == 0):  # Handle leap years for February
+            DJF = ds.sel(time=slice(f"{year-1}-12-01", f"{year}-02-29"))
+        else:
+            DJF = ds.sel(time=slice(f"{year}-12-01", f"{year+1}-02-28"))
+
+        # MAM: March, April, May
+        MAM = ds.sel(time=slice(f"{year}-03-01", f"{year}-05-31"))
+
+        # JJA: June, July, August
+        JJA = ds.sel(time=slice(f"{year}-06-01", f"{year}-08-31"))
+
+        # SON: September, October, November
+        SON = ds.sel(time=slice(f"{year}-09-01", f"{year}-11-30"))
+
+        # Calculate the sum of recharge for each season
+        DJF_sum = DJF.sum(dim='time')
+        MAM_sum = MAM.sum(dim='time')
+        JJA_sum = JJA.sum(dim='time')
+        SON_sum = SON.sum(dim='time')
+
+        # Append the seasonal sums to the dictionary
+
+        DJF_totals.append(DJF_sum)
+        MAM_totals.append(MAM_sum)
+        JJA_totals.append(JJA_sum)
+        SON_totals.append(SON_sum)
+
+        #calculate the mean of each season
+        DJF_mean = sum(DJF_totals)/len(DJF_totals)
+        MAM_mean = sum(MAM_totals)/len(MAM_totals)
+        JJA_mean = sum(JJA_totals)/len(JJA_totals)
+        SON_mean = sum(SON_totals)/len(SON_totals)
+
+        #seasons
+        seasonal_totals['DJF'] = DJF_mean
+        seasonal_totals['MAM'] = MAM_mean
+        seasonal_totals['JJA'] = JJA_mean
+        seasonal_totals['SON'] = SON_mean
+
+    return seasonal_totals
