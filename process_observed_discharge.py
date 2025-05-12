@@ -94,50 +94,6 @@ def extract_timeseries_wallonie(source_folder):
 
 #============================================================================================================================
 
-def extract_timeseries_waterinfo(source_folder):
-    """
-    Extracts time series data and metadata from Waterinfo csv files.
-
-    Parameters:
-    source_folder (str): Folder containing Waterinfo .xlsx files.
-
-    Returns:
-    station_Q (dict): Dictionary of station names → time series DataFrames.
-    info_df (pd.DataFrame): DataFrame with station names as index and lat/lon as columns.
-    """
-    station_info = {}  # Metadata per station
-    station_Q = {}     # Time series per station
-
-    files = glob.glob(os.path.join(source_folder, '*.csv'))
-
-    for f in files:
-        try:
-            df = pd.read_excel(f, engine='openpyxl', header=None)
-            filename = os.path.basename(f)
-            
-            # Extract header info
-            df_header = df.head(6)
-            station_name = str(df_header.iloc[0, 1]).strip()
-            lat = float(df_header.iloc[1, 1])
-            lon = float(df_header.iloc[2, 1])
-            station_info[station_name] = {'lat': lat, 'lon': lon}
-
-            # Extract time series
-            data = df.iloc[9:, [0, 1]].copy()
-            data.columns = ['Date', 'Q']
-            data.dropna(subset=['Date'], inplace=True)
-            data['Date'] = pd.to_datetime(data['Date'], format='%d/%m/%Y %H:%M:%S', errors='coerce')
-            data.set_index('Date', inplace=True)
-            data = data.resample('D').mean()
-
-            station_Q[station_name] = data
-        except Exception as e:
-            print(f"Failed to process {f}: {e}")
-
-    info_df = pd.DataFrame.from_dict(station_info, orient='index')
-
-    return station_Q, info_df
-
 
 
 
