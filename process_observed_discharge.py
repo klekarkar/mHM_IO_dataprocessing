@@ -4,8 +4,10 @@ import os
 import numpy as np
 import shutil
 import openpyxl
+import xarray as xr
 import glob
-
+import pickle
+import matplotlib.pyplot as plt
 import zipfile
 
 def unzip_files(zipped_folder, unzipped_folder):
@@ -22,7 +24,7 @@ def unzip_files(zipped_folder, unzipped_folder):
         except zipfile.BadZipFile:
             print(f"Skipping corrupt file: {zipfile_name}")
 
-
+#============================================================================================================================
 def copy_to_common_folder(src_folder, common_folder):
     """
     Copies all files from subdirectories within the source folder to the common folder.
@@ -90,11 +92,250 @@ def extract_timeseries_wallonie(source_folder):
 
     info_df = pd.DataFrame.from_dict(station_info, orient='index')
 
+    info_df = info_df.reset_index()
+    #rename the columns
+    info_df.columns = ['station_name', 'station_latitude', 'station_longitude']
+
     return station_Q, info_df
 
 #============================================================================================================================
 
+def load_or_extract_wallonie_data(dict_path, df_path, compute_func, *args, **kwargs):
+    """
+    Load Q_dict and station_coords from pickle if available,
+    otherwise run compute_func and cache the results.
+    Args:
+        dict_path (str): Path to the pickle file for Q_dict.
+        df_path (str): Path to the pickle file for station_coords.
+        compute_func (callable): Function to compute Q_dict and station_coords.
+        *args: Positional arguments for compute_func.
+        **kwargs: Keyword arguments for compute_func.
+    Returns:
+        tuple: Q_dict and station_coords.
 
+    """
+    if os.path.exists(dict_path) and os.path.exists(df_path):
+        print("Loading cached Wallonie discharge data...")
+        with open(dict_path, 'rb') as f1, open(df_path, 'rb') as f2:
+            return pickle.load(f1), pickle.load(f2)
+    else:
+        print("Processing Wallonie discharge data (first time)...")
+        Q_dict, station_coords = compute_func(*args, **kwargs)
+        with open(dict_path, 'wb') as f1:
+            pickle.dump(Q_dict, f1)
+        with open(df_path, 'wb') as f2:
+            pickle.dump(station_coords, f2)
+        return Q_dict, station_coords
+
+#============================================================================================================================
+#Extract subset of stations for model evaluation based on peak discharge
+def extract_eval_stations(Q_dict, threshold_max, min_length_days):
+    """
+    Extracts stations for model evaluation based on peak discharge and non-NaN data length.
+    
+    Parameters:
+    Q_dict (dict): Dictionary of station names → time series DataFrames with a 'Q' column.
+    threshold_max (float): Minimum peak discharge (Q) required for inclusion.
+    min_length_days (int): Minimum number of valid (non-NaN) daily discharge values required.
+    
+    Returns:
+    eval_stations (dict): Dictionary of stations that meet the criteria.
+    """
+    eval_stations = {}
+
+    for station_name, df in Q_dict.items():
+        if 'Q' not in df.columns:
+            continue  # Skip if 'Q' column is missing
+
+        q_valid = df['Q'].dropna()
+        max_Q = q_valid.max()
+        valid_days = len(q_valid)
+
+        if max_Q > threshold_max and valid_days >= min_length_days:
+            eval_stations[station_name] = df
+        # Optionally log excluded stations:
+        # else:
+        #     print(f"Excluded {station_name}: max Q = {max_Q}, valid days = {valid_days}")
+
+    return eval_stations
+
+
+#============================================================================================================================
+def extract_netCDF_timeseries(dataset_path, stations_file, var):
+    """
+    Extracts time series data from a NetCDF file for multiple stations.
+    Parameters:
+    dataset_path (str): Path to the NetCDF file.
+    stations_file (str): Path to the CSV file containing station names and coordinates.
+    var (str): Variable name to extract from the NetCDF file.
+
+    Returns:
+    pd.DataFrame: DataFrame containing the extracted time series data.
+    """
+
+
+    # Load the NetCDF file using xarray
+    dataset = xr.open_dataset(dataset_path)
+
+    # Check variable exists
+    if var not in dataset.variables:
+        raise ValueError(f"Variable '{var}' not found in dataset.")
+
+    # Load station list
+    stations = pd.read_csv(stations_file)
+
+    # Ensure required columns exist
+    if not {'name', 'lat', 'lon'}.issubset(stations.columns):
+        raise ValueError("CSV file must contain 'name', 'lat', 'lon' columns.")
+
+    # Output directory
+    output_dir = f'extracted_timeseries/{var}'
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Loop over stations
+    for _, row in stations.iterrows():
+        station_name = row['name']
+        lat = row['lat']
+        lon = row['lon']
+
+        try:
+            # Extract time series at nearest grid point
+            data = dataset[var].sel(lat=lat, lon=lon, method='nearest')
+
+            # Convert to DataFrame and save
+            df = data.to_pandas()
+            df.index.name = 'Date'
+            df.columns = ['Q']
+            df.to_csv(os.path.join(output_dir, f"{station_name}.csv"), header=True, index=True)
+
+            print(f"Saved: {station_name}.csv", end='\r')
+        except Exception as e:
+            print(f"Error processing station '{station_name}' ({lat}, {lon}): {e}")
+
+    print("All stations processed!")
+
+#=============================================================================================================================
+#MODEL PERFORMANCE
+
+def compute_model_metrics(observed, simulated, epsilon=1e-6):
+    """
+    Computes NSE, KGE, PBIAS, and LNSE between observed and simulated data.
+
+    Parameters:
+    - observed: array-like of observed values
+    - simulated: array-like of simulated values
+    - epsilon: small constant to avoid log(0) in LNSE
+
+    Returns:
+    - metrics (dict): Dictionary with rounded values of all metrics
+    """
+    observed = np.array(observed)
+    simulated = np.array(simulated)
+
+    # Drop NaNs and align
+
+    if len(observed) == 0 or np.std(observed) == 0:
+        return {'NSE': np.nan, 'KGE': np.nan, 'PBIAS': np.nan, 'LNSE': np.nan}
+
+    # NSE
+    nse_denom = np.sum((observed - np.mean(observed)) ** 2)
+    nse = 1 - (np.sum((observed - simulated) ** 2) / nse_denom) if nse_denom != 0 else np.nan
+
+    # KGE
+    if np.std(simulated) == 0 or np.mean(observed) == 0:
+        kge = np.nan
+    else:
+        # Convert and flatten arrays
+        x = np.array(observed, dtype=float).flatten()
+        y = np.array(simulated, dtype=float).flatten()
+
+        # Drop NaNs from both
+        mask = ~np.isnan(x) & ~np.isnan(y)
+        x = x[mask]
+        y = y[mask]
+
+        # Now safely calculate correlation
+        if len(x) >= 2:
+            r = np.corrcoef(x, y)[0, 1]
+        else:
+            r = np.nan  # Not enough data
+
+        # Calculate KGE components
+        if np.std(simulated) == 0 or np.mean(observed) == 0:
+            kge = np.nan
+        else:
+            beta = np.mean(simulated) / np.mean(observed)
+            gamma = np.std(simulated) / np.std(observed)
+            kge = 1 - np.sqrt((r - 1)**2 + (beta - 1)**2 + (gamma - 1)**2)
+
+    # PBIAS
+    pbias = 100 * np.sum(simulated - observed) / np.sum(observed) if np.sum(observed) != 0 else np.nan
+
+    # LNSE
+    # Make sure you're working with NumPy arrays of float type
+    observed = np.array(observed, dtype=float)
+    simulated = np.array(simulated, dtype=float)
+
+    # Drop any NaNs (or infinite values if needed)
+    mask = ~np.isnan(observed) & ~np.isnan(simulated)
+    observed = observed[mask]
+    simulated = simulated[mask]
+
+    # Now apply log safely
+    epsilon = 1e-10
+    log_obs = np.log(observed + epsilon)
+    log_sim = np.log(simulated + epsilon)
+    lnse_denom = np.sum((log_obs - np.mean(log_obs)) ** 2)
+    lnse = 1 - (np.sum((log_obs - log_sim) ** 2) / lnse_denom) if lnse_denom != 0 else np.nan
+
+
+    return {
+        'NSE': np.round(nse, 2),
+        'KGE': np.round(kge, 2),
+        'PBIAS': np.round(pbias, 2),
+        'LNSE': np.round(lnse, 2)
+    }
+
+#=============================================================================================================================
+#TIMESERIES PLOTTING
+
+def plot_station_timeseries(station_name, observed_dict, sim_dir):
+    """
+    Plot observed and simulated time series for a given station.
+    """
+    # Load observed
+    if station_name not in observed_dict:
+        print(f"Station {station_name} not found in observed data.")
+        return
+    obs = observed_dict[station_name].copy()
+    obs = obs.replace(-9999, pd.NA).resample('D').mean()
+
+    # Load simulated
+    sim_file = os.path.join(sim_dir, f"{station_name}.csv")
+    if not os.path.exists(sim_file):
+        print(f"Simulation file not found for station: {sim_file}")
+        return
+    sim = pd.read_csv(sim_file, parse_dates=['time'], index_col='time')
+
+    # Merge and align
+    df = pd.concat([obs, sim], axis=1)
+    df.columns = ['Observed', 'Simulated']
+    #df = df.dropna()
+
+    # Trim to overlapping date range
+    start_date = max(obs.dropna().index.min(), sim.dropna().index.min())
+    end_date = min(obs.dropna().index.max(), sim.dropna().index.max())
+    df = df[(df.index >= start_date) & (df.index <= end_date)]
+    df = df.sort_index()
+
+    # Plot
+    plt.figure(figsize=(11, 3.5), dpi=200)
+    df.plot(ax=plt.gca(), linewidth=1, color=['black', 'dodgerblue'])
+    plt.title(f"Discharge at {station_name}")
+    plt.ylabel("Discharge (m$^3$/s)")
+    plt.grid(True, alpha=0.5)
+    plt.tight_layout()
+    plt.show()
 
 
 
