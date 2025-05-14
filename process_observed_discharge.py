@@ -14,9 +14,20 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
+import geopandas as gpd
+import sys
 #//////////////////////////////////////
 
 def unzip_files(zipped_folder, unzipped_folder):
+    """
+    Unzips all .zip files in the specified folder to a new folder.
+    Parameters:
+    zipped_folder (str): Path to the folder containing .zip files.
+    unzipped_folder (str): Path to the folder where files will be extracted.
+
+    Returns:
+    Unzipped files in the specified unzipped dir.
+    """
     os.makedirs(unzipped_folder, exist_ok=True)
 
     zip_files = [f for f in os.listdir(zipped_folder) if f.lower().endswith('.zip')]
@@ -91,6 +102,7 @@ def extract_timeseries_wallonie(source_folder):
             data['Date'] = pd.to_datetime(data['Date'], format='%d/%m/%Y %H:%M:%S', errors='coerce')
             data.set_index('Date', inplace=True)
             data = data.resample('D').mean()
+            data.sort_index(inplace=True)
 
             station_Q[station_name] = data
         except Exception as e:
@@ -121,17 +133,19 @@ def load_or_extract_wallonie_data(dict_path, df_path, compute_func, *args, **kwa
 
     """
     if os.path.exists(dict_path) and os.path.exists(df_path):
-        print("Loading cached Wallonie discharge data...")
+        print("Loading cached Wallonie discharge data...", end='\r')
         with open(dict_path, 'rb') as f1, open(df_path, 'rb') as f2:
             return pickle.load(f1), pickle.load(f2)
     else:
-        print("Processing Wallonie discharge data (first time)...")
+        print("Processing Wallonie discharge data (first time)...", end='\r')
         Q_dict, station_coords = compute_func(*args, **kwargs)
         with open(dict_path, 'wb') as f1:
             pickle.dump(Q_dict, f1)
         with open(df_path, 'wb') as f2:
             pickle.dump(station_coords, f2)
         return Q_dict, station_coords
+    print("Data processing complete!")
+
 
 #============================================================================================================================
 #Extract subset of stations for model evaluation based on peak discharge
@@ -164,7 +178,6 @@ def extract_eval_stations(Q_dict, threshold_max, min_length_days):
         #     print(f"Excluded {station_name}: max Q = {max_Q}, valid days = {valid_days}")
 
     return eval_stations
-
 
 #============================================================================================================================
 def extract_netCDF_timeseries(dataset_path, stations_file, var):
@@ -302,6 +315,75 @@ def compute_model_metrics(observed, simulated, epsilon=1e-6):
         'LNSE': np.round(lnse, 2)
     }
 #=============================================================================================================================
+#multistation model performance
+def status(msg, width=80):
+    """
+    Print msg overwriting the previous line.
+    Pads/truncates to `width` so old text is fully cleared.
+    """
+    sys.stdout.write('\r' + msg.ljust(width)[:width])
+    sys.stdout.flush()
+
+
+def compute_multistation_metrics(simulated_Q_dir, eval_stations_Q, cal_start, cal_end, val_start, val_end):
+    """
+    Computes model performance metrics for multiple stations.
+
+    Parameters:
+    - simulated_Q_dir (str): Directory containing simulated discharge CSV files.
+    - eval_stations_Q (dict): Dictionary of observed discharge DataFrames.
+    - cal_start (str): Start date for calibration period (YYYY-MM-DD).
+    - cal_end (str): End date for calibration period (YYYY-MM-DD).
+    - val_start (str): Start date for validation period (YYYY-MM-DD).
+    - val_end (str): End date for validation period (YYYY-MM-DD).
+    Returns:
+    - model_metrics_cal (dict): Dictionary of calibration metrics for each station: NSE, KGE, PBIAS, LNSE.
+    - model_metrics_val (dict): Dictionary of validation metrics for each station.
+    """
+
+    model_metrics_cal = {}
+    model_metrics_val = {}
+
+    sim_df_files = glob.glob(os.path.join(simulated_Q_dir, '*.csv'))
+
+    for file in sim_df_files:
+        station = os.path.basename(file).split('.')[0]
+
+        df_sim = pd.read_csv(file, parse_dates=['time'], index_col='time')
+
+        if station not in eval_stations_Q:
+            status(f"Station {station} not found, skipping to the next station.")
+            continue
+
+        df_obs = eval_stations_Q[station].copy()
+        df_obs.replace(-9999, np.nan, inplace=True)
+        df_obs = df_obs.resample('D').mean()
+
+        obs_sim = pd.concat([df_obs, df_sim], axis=1)
+        obs_sim.columns = ['observed', 'simulated']
+        obs_sim.dropna(inplace=True)
+
+        # Calibration period
+        cal = obs_sim[cal_start:cal_end]
+        if len(cal) >= 365:
+            model_metrics_cal[station] = compute_model_metrics(cal['observed'], cal['simulated'])
+        else:
+            status(f"Calibration period too short for {station} ({len(cal)} days)")
+            model_metrics_cal[station] = None
+
+        # Validation period
+        val = obs_sim[val_start:val_end]
+        if len(val) >= 365:
+            model_metrics_val[station] = compute_model_metrics(val['observed'], val['simulated'])
+        else:
+            status(f"Validation period too short for {station} ({len(val)} days)")
+            model_metrics_val[station] = None
+
+    return model_metrics_cal, model_metrics_val
+
+
+
+#=============================================================================================================================
 #CONVERT DICTIONARY TO DATAFRAME
 def dict_to_df(metrics_dict):
     """
@@ -342,7 +424,8 @@ def plot_station_timeseries(station_name, observed_dict, sim_dir):
     # Merge and align
     df = pd.concat([obs, sim], axis=1)
     df.columns = ['Observed', 'Simulated']
-    #df = df.dropna()
+
+    df['Simulated'] = df['Simulated'].where(df['Observed'].notna(), np.nan)
 
     # Trim to overlapping date range
     start_date = max(obs.dropna().index.min(), sim.dropna().index.min())
@@ -351,12 +434,15 @@ def plot_station_timeseries(station_name, observed_dict, sim_dir):
     df = df.sort_index()
 
     # Plot
-    plt.figure(figsize=(11, 3.5), dpi=200)
-    df.plot(ax=plt.gca(), linewidth=1, color=['black', 'dodgerblue'])
-    plt.title(f"Discharge at {station_name}")
-    plt.ylabel("Discharge (m$^3$/s)")
-    plt.grid(True, alpha=0.5)
-    plt.tight_layout()
+    fig, ax =plt.subplots(figsize=(12, 3.6), dpi=110)
+
+    ax.plot(df.index, df['Observed'], label='Observed', color='k', linewidth=0.9)
+    ax.plot(df.index, df['Simulated'], label='Simulated', color='dodgerblue', linewidth=0.8)
+    #df.plot(ax=plt.gca(), linewidth=1, color=['black', 'dodgerblue'])
+    ax.set_ylabel("Discharge (m$^3$/s)")
+    ax.grid(True, alpha=0.5)
+    ax.set_title(f"Discharge at {station_name}")
+    ax.legend()
     plt.show()
 
 #=============================================================================================================================
@@ -384,8 +470,8 @@ def map_model_stats(boundary_shp_path, rivers_shp_path, stats_gdf, performance_s
     stat_max = gdf[performance_statistic].max()
 
     if stat_max != stat_min:
-        norm_kge = (gdf[performance_statistic] - stat_min) / (stat_max - stat_min)
-        marker_sizes = norm_kge * 150
+        norm_stat = (gdf[performance_statistic] - stat_min) / (stat_max - stat_min)
+        marker_sizes = norm_stat * 180
     else:
         marker_sizes = np.full(len(gdf), 40)
     
@@ -397,9 +483,9 @@ def map_model_stats(boundary_shp_path, rivers_shp_path, stats_gdf, performance_s
     fig, ax = plt.subplots(subplot_kw={'projection': ccrs.PlateCarree()}, figsize=(12, 8), dpi=110)
 
     # Plot shapefile boundary
-    shp.boundary.plot(ax=ax, edgecolor='b', linewidth=1.0, alpha=0.5, transform=ccrs.PlateCarree())
+    shp.boundary.plot(ax=ax, edgecolor='gray', linewidth=1.0, alpha=0.5, transform=ccrs.PlateCarree())
     # Plot rivers
-    rivers.plot(ax=ax, edgecolor='gray', linewidth=0.5, alpha=0.3, transform=ccrs.PlateCarree())
+    rivers.plot(ax=ax, edgecolor='dodgerblue', linewidth=0.5, alpha=0.3, transform=ccrs.PlateCarree())
 
     # Scatter plot of GeoDataFrame with color and size
     sc = ax.scatter(
@@ -416,9 +502,9 @@ def map_model_stats(boundary_shp_path, rivers_shp_path, stats_gdf, performance_s
     #Add grids to the map
     ax.gridlines(draw_labels=True, color='gray', lw=0.6, alpha=0.2)
 
-
-    # Add colorbar
-    cbar = plt.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=ax, orientation='vertical', pad=0.05)
+    # Add colorbar and labelsize
+    cbar = plt.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=ax, orientation='vertical', pad=0.04)
+    cbar.ax.tick_params(labelsize=12)
     cbar.set_label(performance_statistic, fontsize=12)
 
     # Optional
