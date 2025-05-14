@@ -9,6 +9,12 @@ import glob
 import pickle
 import matplotlib.pyplot as plt
 import zipfile
+import cartopy
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
+#//////////////////////////////////////
 
 def unzip_files(zipped_folder, unzipped_folder):
     os.makedirs(unzipped_folder, exist_ok=True)
@@ -295,6 +301,22 @@ def compute_model_metrics(observed, simulated, epsilon=1e-6):
         'PBIAS': np.round(pbias, 2),
         'LNSE': np.round(lnse, 2)
     }
+#=============================================================================================================================
+#CONVERT DICTIONARY TO DATAFRAME
+def dict_to_df(metrics_dict):
+    """
+    Convert a dictionary of metrics to a DataFrame.
+    
+    Parameters:
+    metrics_dict (dict): Dictionary of metrics with station names as keys.
+    
+    Returns:
+    pd.DataFrame: DataFrame containing the metrics.
+    """
+    df = pd.DataFrame.from_dict(metrics_dict, orient='index')
+    df.reset_index(inplace=True)
+    df.rename(columns={'index': 'name'}, inplace=True)
+    return df
 
 #=============================================================================================================================
 #TIMESERIES PLOTTING
@@ -336,6 +358,72 @@ def plot_station_timeseries(station_name, observed_dict, sim_dir):
     plt.grid(True, alpha=0.5)
     plt.tight_layout()
     plt.show()
+
+#=============================================================================================================================
+#MAP MODEL PERFORMANCE
+
+def map_model_stats(boundary_shp_path, rivers_shp_path, stats_gdf, performance_statistic, cmap):
+    """
+    Maps model statistics on a geographical plot.
+    
+    Parameters:
+    boundary_shp (str): Path to the shapefile for the boundary.
+    stats_gdf (GeoDataFrame): GeoDataFrame containing the statistics to be plotted.
+    performance_statistic (str): The name of the performance statistic to be plotted.
+    c_bar (str): The label for the color bar.
+
+    Returns:
+    None: Displays the plot.
+    """
+    shp = gpd.read_file(boundary_shp_path)
+    rivers = gpd.read_file(rivers_shp_path)
+
+    gdf = stats_gdf[stats_gdf[performance_statistic]>0] .copy() # Keep only positive values
+
+    stat_min = gdf[performance_statistic].min()
+    stat_max = gdf[performance_statistic].max()
+
+    if stat_max != stat_min:
+        norm_kge = (gdf[performance_statistic] - stat_min) / (stat_max - stat_min)
+        marker_sizes = norm_kge * 150
+    else:
+        marker_sizes = np.full(len(gdf), 40)
+    
+    # Normalize color range for KGE
+    norm = Normalize(vmin=0.2, vmax=0.9)
+    cmap = plt.get_cmap(cmap)
+
+    # Set up figure and axis
+    fig, ax = plt.subplots(subplot_kw={'projection': ccrs.PlateCarree()}, figsize=(12, 8), dpi=110)
+
+    # Plot shapefile boundary
+    shp.boundary.plot(ax=ax, edgecolor='b', linewidth=1.0, alpha=0.5, transform=ccrs.PlateCarree())
+    # Plot rivers
+    rivers.plot(ax=ax, edgecolor='gray', linewidth=0.5, alpha=0.3, transform=ccrs.PlateCarree())
+
+    # Scatter plot of GeoDataFrame with color and size
+    sc = ax.scatter(
+        gdf.geometry.x, gdf.geometry.y,
+        c=gdf[performance_statistic],
+        s=marker_sizes,
+        cmap=cmap,
+        norm=norm,
+        edgecolor='gray',
+        linewidth=0.4,
+        transform=ccrs.PlateCarree()
+    )
+
+    #Add grids to the map
+    ax.gridlines(draw_labels=True, color='gray', lw=0.6, alpha=0.2)
+
+
+    # Add colorbar
+    cbar = plt.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=ax, orientation='vertical', pad=0.05)
+    cbar.set_label(performance_statistic, fontsize=12)
+
+    # Optional
+    ax.set_title(f'{performance_statistic}', fontsize=14)
+    plt.tight_layout()
 
 
 
