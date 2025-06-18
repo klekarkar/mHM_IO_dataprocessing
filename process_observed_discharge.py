@@ -1,6 +1,9 @@
 
-import pandas as pd
 import os
+import sys
+import pandas as pd
+from dask.diagnostics import ProgressBar
+from dask import delayed, compute
 import numpy as np
 import shutil
 import openpyxl
@@ -15,7 +18,7 @@ import cartopy.feature as cfeature
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 import geopandas as gpd
-import sys
+
 #//////////////////////////////////////
 
 def unzip_files(zipped_folder, unzipped_folder):
@@ -180,58 +183,88 @@ def extract_eval_stations(Q_dict, threshold_max, min_length_days):
     return eval_stations
 
 #============================================================================================================================
-def extract_netCDF_timeseries(dataset_path, stations_file, var):
+def extract_timeseries_from_netCDF(
+    dataset_path, 
+    station_coordinates_csv, 
+    var, 
+    outDir, 
+    num_workers=8
+):
     """
-    Extracts time series data from a NetCDF file for multiple stations.
-    Parameters:
-    dataset_path (str): Path to the NetCDF file.
-    stations_file (str): Path to the CSV file containing station names and coordinates.
-    var (str): Variable name to extract from the NetCDF file.
+    Extract time series from a NetCDF file for multiple station coordinates using Dask,
+    and save each station's time series as a separate CSV file.
 
-    Returns:
-    pd.DataFrame: DataFrame containing the extracted time series data.
+    Parameters
+    ----------
+    dataset_path : str
+        Path to the NetCDF file.
+    station_coordinates_csv : str
+        Path to the CSV file with columns: name, lat, lon.
+    var : str
+        Variable to extract from the NetCDF file.
+    outDir : str
+        Base output directory where CSVs will be saved.
+    num_workers : int, optional
+        Number of parallel threads to use for writing files (default is 8).
     """
+    
+    # 1) Load station data and drop duplicates
+    stations = pd.read_csv(station_coordinates_csv, encoding='utf-8')
 
+    stations = stations.drop_duplicates(subset='name', keep='last')
 
-    # Load the NetCDF file using xarray
-    dataset = xr.open_dataset(dataset_path)
+    names = stations['name'].values
+    lats = stations['lat'].values
+    lons = stations['lon'].values
 
-    # Check variable exists
-    if var not in dataset.variables:
-        raise ValueError(f"Variable '{var}' not found in dataset.")
+    # 2) Load dataset with chunking
+    ds = xr.open_dataset(dataset_path, chunks={'time': 500})
 
-    # Load station list
-    stations = pd.read_csv(stations_file)
+    if var not in ds:
+        raise ValueError(f"Variable '{var}' not found in the dataset.")
 
-    # Ensure required columns exist
-    if not {'name', 'lat', 'lon'}.issubset(stations.columns):
-        raise ValueError("CSV file must contain 'name', 'lat', 'lon' columns.")
+    # 3) Select variable at all station locations
+    point_da = ds[var].sel(
+        lat=xr.DataArray(lats, dims='station'),
+        lon=xr.DataArray(lons, dims='station'),
+        method='nearest'
+    )
 
-    # Output directory
-    output_dir = f'extracted_timeseries/{var}'
-    os.makedirs(output_dir, exist_ok=True)
+    # 4) Convert to wide DataFrame
+    df = point_da.to_dataframe(name=var).unstack('station')[var]
+    df.columns = names
 
-    # Loop over stations
-    for _, row in stations.iterrows():
-        station_name = row['name']
-        lat = row['lat']
-        lon = row['lon']
+    # 5) Create output directory
+    out_dir = os.path.join(outDir, var)
+    os.makedirs(out_dir, exist_ok=True)
 
-        try:
-            # Extract time series at nearest grid point
-            data = dataset[var].sel(lat=lat, lon=lon, method='nearest')
+    # 6) Define per-station write function
+    def write_station(name, series):
+        out_path = os.path.join(out_dir, f'{name}.csv')
+        if isinstance(series, pd.DataFrame):
+            if series.shape[1] > 1:
+                print(f"Skipping '{name}' — multiple columns detected")
+                return None
+            series.columns = [var]
+        else:
+            series = series.to_frame(name=var)
+        series.to_csv(out_path, index=True)
+        return out_path
 
-            # Convert to DataFrame and save
-            df = data.to_pandas()
-            df.index.name = 'Date'
-            df.columns = ['Q']
-            df.to_csv(os.path.join(output_dir, f"{station_name}.csv"), header=True, index=True)
+    # 7) Prepare parallel write tasks
+    written_names = set()
+    tasks = []
+    for name in names:
+        if name in written_names or name not in df.columns:
+            continue
+        written_names.add(name)
+        tasks.append(delayed(write_station)(name, df[name]))
 
-            print(f"Saved: {station_name}.csv", end='\r')
-        except Exception as e:
-            print(f"Error processing station '{station_name}' ({lat}, {lon}): {e}")
+    # 8) Compute with Dask thread pool
+    with ProgressBar():
+        results = compute(*tasks, scheduler='threads', num_workers=num_workers)
 
-    print("All stations processed!")
+    print(f"\n {len([r for r in results if r])} files written to: {out_dir}")
 
 #=============================================================================================================================
 #MODEL PERFORMANCE
@@ -346,6 +379,9 @@ def compute_multistation_metrics(simulated_Q_dir, eval_stations_Q, cal_start, ca
 
     sim_df_files = glob.glob(os.path.join(simulated_Q_dir, '*.csv'))
 
+    #sort the files
+    sim_df_files.sort()
+
     for file in sim_df_files:
         station = os.path.basename(file).split('.')[0]
 
@@ -358,6 +394,7 @@ def compute_multistation_metrics(simulated_Q_dir, eval_stations_Q, cal_start, ca
         df_obs = eval_stations_Q[station].copy()
         df_obs.replace(-9999, np.nan, inplace=True)
         df_obs = df_obs.resample('D').mean()
+        df_obs.columns = ['Q']
 
         obs_sim = pd.concat([df_obs, df_sim], axis=1)
         obs_sim.columns = ['observed', 'simulated']
@@ -365,7 +402,7 @@ def compute_multistation_metrics(simulated_Q_dir, eval_stations_Q, cal_start, ca
 
         # Calibration period
         cal = obs_sim[cal_start:cal_end]
-        if len(cal) >= 365:
+        if len(cal) >= 1825:
             model_metrics_cal[station] = compute_model_metrics(cal['observed'], cal['simulated'])
         else:
             status(f"Calibration period too short for {station} ({len(cal)} days)")
@@ -373,7 +410,7 @@ def compute_multistation_metrics(simulated_Q_dir, eval_stations_Q, cal_start, ca
 
         # Validation period
         val = obs_sim[val_start:val_end]
-        if len(val) >= 365:
+        if len(val) >= 1825:
             model_metrics_val[station] = compute_model_metrics(val['observed'], val['simulated'])
         else:
             status(f"Validation period too short for {station} ({len(val)} days)")
@@ -403,13 +440,32 @@ def dict_to_df(metrics_dict):
 #=============================================================================================================================
 #TIMESERIES PLOTTING
 
-def plot_station_timeseries(station_name, observed_dict, sim_dir):
+def plot_station_timeseries(station_name, observed_dict,
+                             sim_dir, cal_metrics_df,
+                             val_metrics_df,
+                             calPeriod_end):
     """
-    Plot observed and simulated time series for a given station.
+    Plot observed and simulated time series for a given station and display NSE values.
+
+    Parameters:
+    -----------
+    station_name : str
+        Name of the station.
+    observed_dict : dict
+        Dictionary of observed Series with datetime index.
+    sim_dir : str
+        Directory where simulated CSVs are stored.
+    cal_metrics_df : pd.DataFrame
+        Calibration metrics.
+    val_metrics_df : pd.DataFrame
+        Validation metrics.
+    calPeriod_end : str
+        Calibration end date (format: 'YYYY-MM-DD').
     """
+
     # Load observed
     if station_name not in observed_dict:
-        print(f"Station {station_name} not found in observed data.")
+        print(f" Station '{station_name}' not found in observed data.")
         return
     obs = observed_dict[station_name].copy()
     obs = obs.replace(-9999, pd.NA).resample('D').mean()
@@ -421,96 +477,231 @@ def plot_station_timeseries(station_name, observed_dict, sim_dir):
         return
     sim = pd.read_csv(sim_file, parse_dates=['time'], index_col='time')
 
-    # Merge and align
-    df = pd.concat([obs, sim], axis=1)
+    # Merge and clean
+    df = pd.concat([obs, sim], axis=1, join='inner')
     df.columns = ['Observed', 'Simulated']
-
     df['Simulated'] = df['Simulated'].where(df['Observed'].notna(), np.nan)
 
     # Trim to overlapping date range
-    start_date = max(obs.dropna().index.min(), sim.dropna().index.min())
-    end_date = min(obs.dropna().index.max(), sim.dropna().index.max())
-    df = df[(df.index >= start_date) & (df.index <= end_date)]
-    df = df.sort_index()
+    start_date = max(df['Observed'].dropna().index.min(), df['Simulated'].dropna().index.min())
+    end_date = min(df['Observed'].dropna().index.max(), df['Simulated'].dropna().index.max())
+    df = df[(df.index >= start_date) & (df.index <= end_date)].sort_index()
 
-    # Plot
-    fig, ax =plt.subplots(figsize=(12, 3.6), dpi=110)
+    # Extract NSE values if present
+    nse_val = None
+    nse_cal = None
 
+    if station_name in val_metrics_df['name'].values:
+        nse_val_row = val_metrics_df.loc[val_metrics_df['name'] == station_name, 'KGE']
+        nse_val = nse_val_row.values[0] if not nse_val_row.empty else None
+
+    if station_name in cal_metrics_df['name'].values:
+        nse_cal_row = cal_metrics_df.loc[cal_metrics_df['name'] == station_name, 'KGE']
+        nse_cal = nse_cal_row.values[0] if not nse_cal_row.empty else None
+
+    # Plotting
+    fig, ax = plt.subplots(figsize=(12, 3.6), dpi=110)
     ax.plot(df.index, df['Observed'], label='Observed', color='k', linewidth=0.9)
     ax.plot(df.index, df['Simulated'], label='Simulated', color='dodgerblue', linewidth=0.8)
-    #df.plot(ax=plt.gca(), linewidth=1, color=['black', 'dodgerblue'])
+
+    # Display NSEs and optional vertical line
+    cal_end_date = pd.to_datetime(calPeriod_end)
+
+    if nse_cal is not None and nse_val is not None:
+        ax.axvline(x=cal_end_date, color='red', lw=0.8)
+        ax.text(0.02, 0.85, f'KGE val: {nse_val:.2f}', transform=ax.transAxes, fontsize=12)
+        ax.text(0.75, 0.85, f'KGE cal: {nse_cal:.2f}', transform=ax.transAxes, fontsize=12)
+    elif nse_cal is not None:
+        ax.text(0.8, 0.85, f'KGE cal: {nse_cal:.2f}', transform=ax.transAxes, fontsize=12)
+    elif nse_val is not None:
+        ax.text(0.8, 0.85, f'KGE val: {nse_val:.2f}', transform=ax.transAxes, fontsize=12)
+
     ax.set_ylabel("Discharge (m$^3$/s)")
-    ax.grid(True, alpha=0.5)
     ax.set_title(f"Discharge at {station_name}")
-    ax.legend()
+    ax.grid(True, alpha=0.5)
+    ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=10)
     plt.show()
 
 #=============================================================================================================================
 #MAP MODEL PERFORMANCE
 
-def map_model_stats(boundary_shp_path, rivers_shp_path, stats_gdf, performance_statistic, cmap):
+def map_model_stats(boundary_shp_path, rivers_shp_path,
+                        calib_gdf, val_gdf,
+                        performance_statistic, cmap='viridis'):
     """
-    Maps model statistics on a geographical plot.
-    
-    Parameters:
-    boundary_shp (str): Path to the shapefile for the boundary.
-    stats_gdf (GeoDataFrame): GeoDataFrame containing the statistics to be plotted.
-    performance_statistic (str): The name of the performance statistic to be plotted.
-    c_bar (str): The label for the color bar.
+    Maps calibration and validation model statistics side by side.
 
-    Returns:
+    Parameters
+    ----------
+    boundary_shp_path : str
+        Path to the shapefile for the boundary.
+    rivers_shp_path : str
+        Path to the shapefile for rivers.
+    calib_gdf : GeoDataFrame
+        GeoDataFrame with calibration statistics.
+    val_gdf : GeoDataFrame
+        GeoDataFrame with validation statistics.
+    performance_statistic : str
+        Name of the performance column to plot (e.g., 'KGE', 'NSE').
+    cmap : str or matplotlib Colormap
+        Colormap to use for both plots.
+
+    Returns
+    -------
     None: Displays the plot.
     """
-    shp = gpd.read_file(boundary_shp_path)
+    # Read shapefiles
+    boundary = gpd.read_file(boundary_shp_path)
     rivers = gpd.read_file(rivers_shp_path)
 
-    gdf = stats_gdf[stats_gdf[performance_statistic]>0] .copy() # Keep only positive values
+    # Filter positive values only
+    calib_gdf = calib_gdf[calib_gdf[performance_statistic] > 0].copy()
+    val_gdf = val_gdf[val_gdf[performance_statistic] > 0].copy()
 
-    stat_min = gdf[performance_statistic].min()
-    stat_max = gdf[performance_statistic].max()
-
-    if stat_max != stat_min:
-        norm_stat = (gdf[performance_statistic] - stat_min) / (stat_max - stat_min)
-        marker_sizes = norm_stat * 180
-    else:
-        marker_sizes = np.full(len(gdf), 40)
-    
-    # Normalize color range for KGE
-    norm = Normalize(vmin=0.2, vmax=0.9)
+    # Shared color normalization across both plots
+    stat_min = min(calib_gdf[performance_statistic].min(), val_gdf[performance_statistic].min())
+    stat_max = max(calib_gdf[performance_statistic].max(), val_gdf[performance_statistic].max())
+    norm = Normalize(vmin=stat_min, vmax=stat_max)
     cmap = plt.get_cmap(cmap)
 
-    # Set up figure and axis
-    fig, ax = plt.subplots(subplot_kw={'projection': ccrs.PlateCarree()}, figsize=(12, 8), dpi=110)
+    # Marker size logic
+    def compute_marker_sizes(gdf):
+        if stat_max != stat_min:
+            norm_stat = (gdf[performance_statistic] - stat_min) / (stat_max - stat_min)
+            return norm_stat * 180
+        else:
+            return np.full(len(gdf), 40)
 
-    # Plot shapefile boundary
-    shp.boundary.plot(ax=ax, edgecolor='gray', linewidth=1.0, alpha=0.5, transform=ccrs.PlateCarree())
-    # Plot rivers
-    rivers.plot(ax=ax, edgecolor='dodgerblue', linewidth=0.5, alpha=0.3, transform=ccrs.PlateCarree())
+    calib_sizes = compute_marker_sizes(calib_gdf)
+    val_sizes = compute_marker_sizes(val_gdf)
 
-    # Scatter plot of GeoDataFrame with color and size
-    sc = ax.scatter(
-        gdf.geometry.x, gdf.geometry.y,
-        c=gdf[performance_statistic],
-        s=marker_sizes,
-        cmap=cmap,
-        norm=norm,
-        edgecolor='gray',
-        linewidth=0.4,
-        transform=ccrs.PlateCarree()
-    )
+    # Set up side-by-side maps
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6), subplot_kw={'projection': ccrs.PlateCarree()}, dpi=110)
+    titles = ['Calibration', 'Validation']
+    datasets = [(calib_gdf, calib_sizes), (val_gdf, val_sizes)]
 
-    #Add grids to the map
-    ax.gridlines(draw_labels=True, color='gray', lw=0.6, alpha=0.2)
+    for i, (gdf, sizes) in enumerate(datasets):
+        ax = axes[i]
 
-    # Add colorbar and labelsize
-    cbar = plt.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=ax, orientation='vertical', pad=0.04)
+        # Plot boundary and rivers
+        boundary.boundary.plot(ax=ax, edgecolor='gray', linewidth=1.0, alpha=0.5, transform=ccrs.PlateCarree())
+        rivers.plot(ax=ax, edgecolor='dodgerblue', linewidth=0.5, alpha=0.3, transform=ccrs.PlateCarree())
+
+        # Plot scatter of performance
+        sc = ax.scatter(
+            gdf.geometry.x, gdf.geometry.y,
+            c=gdf[performance_statistic],
+            s=sizes,
+            cmap=cmap,
+            norm=norm,
+            edgecolor='black',
+            linewidth=0.3,
+            transform=ccrs.PlateCarree()
+        )
+
+        # Add gridlines
+        gl = ax.gridlines(draw_labels=True, color='gray', lw=0.6, alpha=0.2)
+        gl.top_labels = gl.right_labels = False
+
+        ax.set_title(f'{titles[i]}: {performance_statistic}', fontsize=14)
+
+    # Shared colorbar
+    cbar = plt.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=axes, orientation='vertical', pad=0.02)
     cbar.ax.tick_params(labelsize=12)
     cbar.set_label(performance_statistic, fontsize=12)
 
-    # Optional
-    ax.set_title(f'{performance_statistic}', fontsize=14)
     plt.tight_layout()
+    plt.show()
 
+#=============================================================================================================================
+def map_calib_val_stats(boundary_shp_path, rivers_shp_path,
+                        calib_gdf, val_gdf,
+                        performance_statistic, cmap='viridis'):
+    """
+    Maps calibration and validation model statistics side by side.
+    """
+    # Read shapefiles
+    boundary = gpd.read_file(boundary_shp_path)
+    rivers = gpd.read_file(rivers_shp_path)
+
+    # Filter positive values only
+    calib_gdf = calib_gdf[calib_gdf[performance_statistic] > 0].copy()
+    val_gdf = val_gdf[val_gdf[performance_statistic] > 0].copy()
+
+    # Shared color normalization across both plots
+    stat_min = min(calib_gdf[performance_statistic].min(), val_gdf[performance_statistic].min())
+    stat_max = max(calib_gdf[performance_statistic].max(), val_gdf[performance_statistic].max())
+    norm = Normalize(vmin=stat_min, vmax=stat_max)
+    cmap = plt.get_cmap(cmap)
+
+    def compute_marker_sizes(gdf):
+        if stat_max != stat_min:
+            norm_stat = (gdf[performance_statistic] - stat_min) / (stat_max - stat_min)
+            return norm_stat * 100
+        else:
+            return np.full(len(gdf), 40)
+
+    calib_sizes = compute_marker_sizes(calib_gdf)
+    val_sizes = compute_marker_sizes(val_gdf)
+
+    # Create side-by-side subplots with a dedicated colorbar axis
+    fig = plt.figure(figsize=(14, 7), dpi=180)
+
+    # Define the axes for the two plots and the colorbar
+    #plt.subplot2grid((nrows, ncols), (start_row, start_col), colspan=..., rowspan=...)
+    ax1 = plt.subplot2grid((6, 25), (0, 0), rowspan=5, colspan=9, projection=ccrs.PlateCarree()) #ax1 occupies the first 9 columns
+    ax2 = plt.subplot2grid((6, 25), (0, 9), rowspan=5, colspan=9, projection=ccrs.PlateCarree()) #ax2 occupies the next 9 columns
+    
+    # Colorbar axis - placed on the last row
+    # After creating fig
+    cax = fig.add_axes([0.04, 0.22, 0.68, 0.05])  # [left, bottom, width, height] in figure coords (0 to 1)
+
+
+    #space between the two plots
+    plt.subplots_adjust(wspace=0.5)
+
+    axes = [ax1, ax2]
+    titles = ['Calibration', 'Validation']
+    datasets = [(calib_gdf, calib_sizes), (val_gdf, val_sizes)]
+
+    for i, (gdf, sizes) in enumerate(datasets):
+        ax = axes[i]
+
+        boundary.boundary.plot(ax=ax, edgecolor='gray', linewidth=1.0, alpha=0.7, transform=ccrs.PlateCarree())
+        rivers.plot(ax=ax, edgecolor='dodgerblue', linewidth=0.5, alpha=0.3, transform=ccrs.PlateCarree())
+
+        sc = ax.scatter(
+            gdf.geometry.x, gdf.geometry.y,
+            c=gdf[performance_statistic],
+            s=sizes,
+            cmap=cmap,
+            norm=norm,
+            edgecolor='black',
+            linewidth=0.3,
+            transform=ccrs.PlateCarree()
+        )
+
+        # Gridlines and label control
+        gl = ax.gridlines(draw_labels=True, color='gray', lw=0.6, alpha=0.2)
+        #specify gridlines for both axes
+        gl.xlocator = plt.FixedLocator(np.arange(0, 10, 1))
+        gl.ylocator = plt.FixedLocator(np.arange(49.5, 51.9, 0.4))
+        gl.top_labels = True
+        gl.left_labels = True if i == 0 else False
+        gl.right_labels = False
+        gl.bottom_labels = False
+
+        ax.set_title(f'{titles[i]}', fontsize=14)
+
+    # Shared colorbar
+    cbar = plt.colorbar(ScalarMappable(norm=norm, cmap=cmap), cax=cax, orientation='horizontal')
+    cbar.ax.tick_params(labelsize=12)
+    cbar.set_label(performance_statistic, fontsize=12, weight='bold')
+
+    plt.tight_layout()
+    plt.show()
+    return fig
+#=============================================================================================================================
 
 
 
