@@ -29,7 +29,7 @@ def clip_to_region(shapefile, xr_dataset):
         The clipped dataset.
     """
         #set shapefile to crs 4326
-    shapefile = shapefile.to_crs('epsg:4326')
+    shapefile = shapefile.to_crs('epsg:32631')
 
     #drop bnds dimension
     xr_dataset = xr_dataset.drop_dims("bnds", errors="ignore")
@@ -38,7 +38,7 @@ def clip_to_region(shapefile, xr_dataset):
     xr_dataset.rio.set_spatial_dims(x_dim="lon", y_dim="lat", inplace=True)
 
     #write crs
-    xr_dataset.rio.write_crs("EPSG:4326", inplace=True)
+    xr_dataset.rio.write_crs('epsg:32631', inplace=True)
 
     #clip
     clipped = xr_dataset.rio.clip(shapefile.geometry.apply(mapping), shapefile.crs, drop=True)
