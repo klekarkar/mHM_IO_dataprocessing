@@ -186,24 +186,29 @@ def decadal_drought_area(smi_drought, decades, variable, drought_thresholds, lab
 
 def decadal_duration_category(smi_dataset, decades, drought_classes):
     """
-    Calculate the duration of drought events for each category over specified decades.
-    Parameters:
-    smi_dataset (xarray.DataArray): The soil moisture xr to extract the drought classes from. 
-    It is the original SMI dataset, not the drought area dataset.
-    It should have a 'time' dimension and a 'SMI' variable
-    decades (list): List of decades as strings, e.g., ['1971-1980', '1981-1990'].
-    drought_classes (dict): Drought class name -> (low, high) SMI thresholds.
+    Count, per pixel, how many time steps fall in each drought class for each decade.
 
-    Returns:
-    duration_dict (dict): dictionary with decade as key and xarray Dataset of drought durations for each class as value.
+    Parameters
+    ----------
+    smi_dataset : xr.Dataset or xr.DataArray
+        Must contain variable 'SMI' and a 'time' coordinate.
+    decades : list[str]
+        ['1971-1980', '1981-1990', ...]
+    drought_classes : dict[str, tuple]
+        {class_name: (low, high)} where low < SMI ≤ high.
+
+    Returns
+    -------
+    dict[str, xr.Dataset]
+        {decade: Dataset with one DataArray per drought class}
     """
     duration_dict = {}
     for decade in decades:
         start_year, end_year = map(int, decade.split('-'))
         smi_decade = smi_dataset.sel(time=slice(f'{start_year}-01-01', f'{end_year}-12-31'))
 
-        drought_counts = {}
-        for name, (lo, hi) in drought_classes.items(): 
+        cls_durs = {}
+        for cls, (lo, hi) in drought_classes.items(): 
             #lo, hi are the low and high SMI thresholds for each drought class
             # Create a mask for the drought class
             mask = (smi_decade['SMI'] > lo) & (smi_decade['SMI'] <= hi)
@@ -212,16 +217,17 @@ def decadal_duration_category(smi_dataset, decades, drought_classes):
             dedade_dur = mask.sum(dim='time')
 
             # Propagate NaNs using the first timestep of the original SMI data
-            duration = dedade_dur.where(~smi_decade['SMI'][0].isnull())
+            #This ensures that we only count droughts in pixels where SMI is defined
+            duration = dedade_dur.where(~smi_decade['SMI'].isel(time=0).isnull())
 
             #save the duration for each drought class in the dictionary
-            drought_counts[name] = duration
+            cls_durs[cls] = duration
         
         # Convert the drought counts dict to an xarray Dataset
-        drought_counts = xr.Dataset({name: duration for name, duration in drought_counts.items()})
+        cls_durs = xr.Dataset({name: duration for name, duration in cls_durs.items()})
 
         # store the drought counts for the decade in the duration_dict, with decade as the key
-        duration_dict[decade] = drought_counts
+        duration_dict[decade] = cls_durs
 
     return duration_dict
 
