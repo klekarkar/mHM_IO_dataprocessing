@@ -14,6 +14,9 @@ from matplotlib.gridspec import GridSpec
 import matplotlib.dates as mdates
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import mhm_drought_funcs as mdf
+from joblib import Parallel, delayed
+from itertools import product
+import tqdm
 
 #Segoe UI font
 plt.rcParams['font.family'] = 'Segoe UI'
@@ -68,7 +71,7 @@ def ADM_lolliplot(drought_ADM, top_n_events):
 
     # Stems for all events representing duration
     for _, row in drought_ADM.iterrows():
-        ax.plot([row['start_month'], row['start_month']], [0, row['duration']],
+        ax.plot([row['start_month'], row['start_month']], [0, row['TDM']],
                 color='gray', linestyle='-', linewidth=0.2)
 
     # Hollow black circles for all events
@@ -85,10 +88,10 @@ def ADM_lolliplot(drought_ADM, top_n_events):
     cbar.ax.tick_params(labelsize=16)
     cbar.set_label('Total Drought Magnitude', fontsize=18)
 
-    # Add labels below circles
+    # Add labels adjacent to circles
     for _, row in top_TDM.iterrows():
         label = f"{row['start_month'].strftime('%b.%Y')}–{row['end_month'].strftime('%b.%Y')}"
-        ax.text(row['start_month'], row['duration'] + 1.0, label, fontsize=16, ha='center', va='bottom', rotation=72)
+        ax.text(row['start_month'], row['duration'] + 1.0, label, fontsize=18, ha='center', va='bottom', rotation=72)
 
     # Format axes
     ax.set_ylim(-1, drought_ADM['duration'].max() + 4)
