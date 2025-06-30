@@ -3,8 +3,7 @@
 CREATE A DOMAIN GRID 
 -------------------------------------------------
 Use remapbil: https://code.mpimet.mpg.de/boards/2/topics/96
-
-The xfirst and yfirst values are grid centres.
+<<<<<<< working_scripts
 To ensure that the origins of the files match the xllcorner and yllcorner values of the morph files,
 Add half a cell size to xll and yll corners so that;
 if yllcorner is 48.5,
@@ -14,6 +13,13 @@ then yfirst should be 48.5+0.125/2 = 48.5625 and xfirst = 2.0625
 
 Create an empty grid with the desired dimensions
 cat > domain_grid << EOF
+=======
+To ensure that the origins of the files match the xllcorner and yllcorner values of the morph files, add half a cell size to xll and yll corners so that if yllcorner is 49.5 and xllcorner is 2.5, then yfirst should be 49.5+0.03125/2 = 49.515625 and xfirst = 2.515625.
+
+cat > meteo_domain_grid << EOF
+>>>>>>> main
+The xfirst and yfirst values are grid centres.
+
 gridtype = lonlat
 xsize    = 40
 ysize    = 28
