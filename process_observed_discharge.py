@@ -18,6 +18,7 @@ import cartopy.feature as cfeature
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 import geopandas as gpd
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
 #//////////////////////////////////////
 
@@ -703,6 +704,112 @@ def map_calib_val_stats(boundary_shp_path, rivers_shp_path,
     return fig
 #=============================================================================================================================
 
+def map_calib_val_stats(boundary_shp_path, rivers_shp_path,
+                        calib_gdf, val_gdf,
+                        performance_statistic, cmap='Blues'):
+    """
+    Maps calibration and validation model statistics side by side with inset histograms.
+    """
+    # Read shapefiles
+    boundary = gpd.read_file(boundary_shp_path)
+    rivers = gpd.read_file(rivers_shp_path)
 
+    # Filter positive values only
+    calib_gdf = calib_gdf[calib_gdf[performance_statistic] > 0].copy()
+    val_gdf = val_gdf[val_gdf[performance_statistic] > 0].copy()
+
+    # Shared normalization
+    stat_min = min(calib_gdf[performance_statistic].min(), val_gdf[performance_statistic].min())
+    stat_max = max(calib_gdf[performance_statistic].max(), val_gdf[performance_statistic].max())
+    norm = Normalize(vmin=stat_min, vmax=stat_max)
+    cmap = plt.get_cmap(cmap)
+
+    def compute_marker_sizes(gdf):
+        if stat_max != stat_min:
+            norm_stat = (gdf[performance_statistic] - stat_min) / (stat_max - stat_min)
+            return norm_stat * 100
+        else:
+            return np.full(len(gdf), 40)
+
+    calib_sizes = compute_marker_sizes(calib_gdf)
+    val_sizes = compute_marker_sizes(val_gdf)
+
+    # Create subplots
+    fig = plt.figure(figsize=(14, 7), dpi=180)
+    ax1 = plt.subplot2grid((6, 25), (0, 0), rowspan=5, colspan=9, projection=ccrs.PlateCarree())
+    ax2 = plt.subplot2grid((6, 25), (0, 9), rowspan=5, colspan=9, projection=ccrs.PlateCarree())
+    cax = fig.add_axes([0.04, 0.22, 0.68, 0.05])  # colorbar
+
+    plt.subplots_adjust(wspace=0.5)
+
+    axes = [ax1, ax2]
+    titles = ['Calibration', 'Validation']
+    datasets = [(calib_gdf, calib_sizes), (val_gdf, val_sizes)]
+
+    for i, (gdf, sizes) in enumerate(datasets):
+        ax = axes[i]
+
+        boundary.boundary.plot(ax=ax, edgecolor='gray', linewidth=1.0, alpha=0.7, transform=ccrs.PlateCarree())
+        rivers.plot(ax=ax, edgecolor='dodgerblue', linewidth=0.5, alpha=0.3, transform=ccrs.PlateCarree())
+
+        sc = ax.scatter(
+            gdf.geometry.x, gdf.geometry.y,
+            c=gdf[performance_statistic],
+            s=sizes,
+            cmap=cmap,
+            norm=norm,
+            edgecolor='black',
+            linewidth=0.3,
+            transform=ccrs.PlateCarree()
+        )
+
+        gl = ax.gridlines(draw_labels=True, color='gray', lw=0.6, alpha=0.2)
+        gl.xlocator = plt.FixedLocator(np.arange(0, 10, 1))
+        gl.ylocator = plt.FixedLocator(np.arange(49.5, 51.9, 0.4))
+        gl.top_labels = True
+        gl.left_labels = True if i == 0 else False
+        gl.right_labels = False
+        gl.bottom_labels = False
+
+        ax.set_title(f'{titles[i]}', fontsize=14)
+
+        # Inset histogram  bbox_to_anchor = (x0, y0, width, height)
+        inset_ax = inset_axes(ax, width="30%", height="25%", bbox_to_anchor=(-.58, -.62, 1.0, 1.0), bbox_transform=ax.transAxes)
+
+        x = gdf[gdf[performance_statistic]>0.0][performance_statistic].to_numpy()
+
+        cm = plt.cm.get_cmap(cmap)
+        _, bins, patches = inset_ax.hist(x, bins=20, color="r")  # Corrected axis
+        bin_centers = 0.5*(bins[:-1]+bins[1:])
+        col = bin_centers - min(bin_centers)
+        if np.max(col) > 0:
+            col /= np.max(col)
+
+        for c, p in zip(col, patches):
+            plt.setp(p, "facecolor", cm(c))
+            edgecolor = 'gray'
+            lwidth = 0.4
+            plt.setp(p, "edgecolor", edgecolor, "linewidth", lwidth)
+
+        inset_ax.tick_params(axis='both', labelsize=10)
+        inset_ax.set_xlabel(performance_statistic, fontsize=10)
+        inset_ax.set_ylabel('No. of stations', fontsize=10)
+
+        # Change frame color and width
+        for spine in inset_ax.spines.values():
+            spine.set_linewidth(0.5)
+            spine.set_edgecolor('gray')
+
+
+    # Shared colorbar
+    cbar = plt.colorbar(ScalarMappable(norm=norm, cmap=cmap), cax=cax, orientation='horizontal')
+    cbar.ax.tick_params(labelsize=12)
+    cbar.set_label(performance_statistic, fontsize=12, weight='bold')
+
+    plt.tight_layout()
+
+    #save the figure
+    #plt.savefig("calibration_validation_map.png", bbox_inches='tight', dpi=300)
+    return fig
 
 
