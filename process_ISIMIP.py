@@ -3,13 +3,11 @@ import glob
 import xarray as xr
 import numpy as np
 import logging
-from typing import Tuple, Dict
 import numpy as np
 import pandas as pd
 import xarray as xr
-from joblib import Parallel, delayed
-from itertools import product
-from tqdm.auto import tqdm
+import xesmf as xe
+from typing import Any, Dict, List, Tuple
 
 def merge_ISIMIP_datasets(src_isimip, models, scenarios, variables, overwrite=False, verbose=False, log_file='merge_isimip.log'):
     """
@@ -83,6 +81,94 @@ def merge_ISIMIP_datasets(src_isimip, models, scenarios, variables, overwrite=Fa
                     logger.error(f'Error processing {key}: {e}')
 
     return summary
+#=========================================================================================================================
+#REGRID ISIMIP DATASETS with XESMF
+
+
+def regrid_ISIMIP_to_obs(isimip_data: dict, obs: xr.DataArray, models: list, scenarios: list, REGRID_METHOD: str,
+                          VAR_NAME: str, VAR_UNITS: str, VAR_STDNAME: str, long_name: str) -> dict:  
+    """
+    Regrid ISIMIP data to EOBS grid using XESMF and return a dictionary of model-scenario combinations.
+    Each key in the dictionary is a string formatted as 'model_scenario_variable', and the value is the regridded data as an xarray.DataArray.
+
+    Parameters:
+        ----------
+    isimip_data (dict): Dictionary containing ISIMIP data.
+    obs (xarray.Dataset): EOBS dataset to regrid to.
+    models (list): List of model names.
+    scenarios (list): List of scenario names.
+    METHOD (str): Regridding method to use (e.g., 'bilinear').
+    VAR_NAME (str): Name of the variable to regrid (e.g., 'pr', 'tasmin', 'tasmax').
+    VAR_UNITS (str): Units of the variable.
+    VAR_STDNAME (str): Standard name of the variable.
+    long_name (str): Long name of the variable.
+
+
+    
+    Returns:
+    dict: Dictionary with model-scenario combinations as keys and regridded data as values.
+    """
+        
+    model_scenario_combos ={}
+
+    #create regridder from one of the models. Only if all models have the same extent and resolution
+    #data_grid = xe.Regridder(isimip_data[(models[0], scenarios[0], VAR_NAME)], obs, method='bilinear')
+
+
+    for model in models:
+        for scenario in scenarios:
+                if (model, scenario, VAR_NAME) in isimip_data:
+
+                    #change key to model_scenario_pr
+                    name = f"{model}_{scenario}_{VAR_NAME}"
+
+                    # Extract the variable
+                    if VAR_NAME == 'pr':
+                        # Convert precipitation flux from kg m-2 s-1 to mm/day
+                        data = isimip_data[(model, scenario, VAR_NAME)] * 86400
+
+                        #If temperature variables, convert from Kelvin to Celsius
+                    elif VAR_NAME in ['tasmin', 'tasmax']:
+                        data = isimip_data[(model, scenario, VAR_NAME)]-273.15  
+
+                    #regrid the data to the EOBS grid with xesmf
+                    #regrid with xesmf
+                    data_grid = xe.Regridder(data, obs, method=REGRID_METHOD)
+
+                    # Apply the regridder to the historical simulation
+                    data_regrid = data_grid(data)
+
+                    #Make a mask where obs is not null
+                    valid_mask = obs.notnull().any(dim="time")
+
+                    #data where variance is not zero
+                    #resample to daily
+                    data_regrid = data_regrid.resample(time='1D').sum()
+                    
+                    data_regrid = data_regrid.where(data_regrid.var(dim='time') > 0.0001)
+                    data_regrid = data_regrid.where(valid_mask)
+
+
+                    #Define atributes
+                        # 5) Attach useful attributes
+                    attrs = dict(
+                        units=VAR_UNITS,
+                        standard_name=VAR_STDNAME,
+                        long_name= long_name,
+                        source="ISIMIP3b",
+                        source_model=model,
+                        source_scenario=scenario,
+                        regrid_method=REGRID_METHOD,
+            )
+
+                    #assign attributes
+                    data_regrid = data_regrid.assign_attrs(**attrs)
+
+                    #add to dictionary
+                    model_scenario_combos[name] = data_regrid
+
+    
+    return model_scenario_combos
 
 
 #=========================================================================================================================
@@ -522,3 +608,90 @@ def quantile_delta_mapping(
 
     return hist_bc, fut_bc
 #==========================================================================================================================
+
+### bias correct the regridded data
+def bias_correct_ISIMIP(isimip_regridded: dict, obs: xr.DataArray, models: list, 
+                        future_scenarios: list, method: str, kind="*",
+                         VAR_NAME='pr', VAR_UNITS="mm/day", VAR_STDNAME="precipitation_flux", REGRID_METHOD="bilinear"):
+    """
+    Bias correct the regridded ISIMIP data using Empirical Quantile Mapping.
+    
+    Parameters:
+    model_scenario_combos (dict): Dictionary with model-scenario combinations and regridded data.
+    obs (xarray.DataArray): EOBS dataset to bias correct against.
+    models (list): List of ISIMIP model names.
+    scenarios (list): List of scenario names.
+    method (str): Bias correction method, either 'qdm' for Quantile Delta Mapping or 'eqm' for Empirical Quantile Mapping.
+    kind (str): Kind of interpolation to use ("+": additive for temperature or "*": multiplicative for precipitation), default is "*".
+    
+    Returns:
+    dict: Dictionary with bias-corrected data for each model-scenario combination.
+    """
+    
+    # Create a dictionary to store the bias-corrected data
+    model_scenario_combos_bc = {}
+
+    for model in models:
+            # extract historical and future data for the model
+        hist_data = isimip_regridded.get(f"{model}_historical_{VAR_NAME}")[VAR_NAME]
+
+        if hist_data is None: 
+            print(f"[skip] missing {model} historical"); 
+            continue
+
+        for future in future_scenarios:
+
+            fut_data = isimip_regridded.get(f"{model}_{future}_{VAR_NAME}")[VAR_NAME]
+
+            if fut_data is None: 
+                print(f"[skip] missing {model} {future}"); 
+                continue
+        #set obs to same extent as ISIMIP data
+            obs = obs.sel(lat=slice(hist_data.lat.max(), hist_data.lat.min()),
+                         lon=slice(hist_data.lon.min(), hist_data.lon.max()))
+
+            if method == 'qdm':
+                # Apply QDM bias correction
+                hist_pr_bc, fut_pr_bc = quantile_delta_mapping(obs, hist_data, fut_data, n_quantiles=251, min_valid=10, kind=kind)
+
+            elif method == 'eqm':
+                # Apply EQM bias correction
+                hist_pr_bc, fut_pr_bc = empirical_quantile_mapping(obs, hist_data, fut_data, n_q=51, min_samples=10)
+            else:
+                raise ValueError("Method must be either 'QDM' or 'EQM'.")
+
+
+            hist_attrs = dict(
+                    units=VAR_UNITS,
+                    standard_name=VAR_STDNAME,
+                    long_name="Regridded precipitation rate",
+                    source_model=model,
+                    source_scenario='historical',
+                    bias_correction_method=method,
+                    regrid_method=REGRID_METHOD,
+                    source="ISIMIP3b"
+        )
+            
+
+            fut_attrs = dict(
+                    units=VAR_UNITS,
+                    standard_name=VAR_STDNAME,
+                    long_name="Regridded precipitation rate",
+                    source_model=model,
+                    source_scenario=future,
+                    bias_correction_method=method,
+                    regrid_method=REGRID_METHOD,
+                    source="ISIMIP3b"
+        )
+            
+            # Assign attributes to the bias-corrected data
+            hist_pr_bc = hist_pr_bc.assign_attrs(**hist_attrs)
+            fut_pr_bc = fut_pr_bc.assign_attrs(**fut_attrs)
+
+
+            # Add the bias-corrected data to the dictionary
+            model_scenario_combos_bc[f"{model}_historical_{method}"] = hist_pr_bc
+            model_scenario_combos_bc[f"{model}_{future}_{method}"] = fut_pr_bc
+
+
+    return model_scenario_combos_bc
