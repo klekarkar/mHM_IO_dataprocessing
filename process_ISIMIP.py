@@ -8,6 +8,7 @@ import pandas as pd
 import xarray as xr
 import xesmf as xe
 from typing import Any, Dict, List, Tuple
+import os, uuid, time, gc
 
 def merge_ISIMIP_datasets(src_isimip, models, scenarios, variables, overwrite=False, verbose=False, log_file='merge_isimip.log'):
     """
@@ -84,6 +85,21 @@ def merge_ISIMIP_datasets(src_isimip, models, scenarios, variables, overwrite=Fa
 #=========================================================================================================================
 #REGRID ISIMIP DATASETS with XESMF
 
+#--------------------------------------------
+#Define the EOBS dataset and variable
+def select_ref_hist(dataset, var, start_date, end_date):
+
+    """
+    Selects the historical data for a specific variable and time period and masks out cells with low variance and removes empty rows and columns.
+    """
+
+    #drop zero variance grids
+    dataset= dataset[var].sel(time=slice(start_date, end_date)).where(dataset[var].var(dim='time') > 0.0001)
+
+    #drop NaN columns and rows
+    dataset = dataset.where(dataset.notnull().any(dim='time')).dropna(dim='lat', how='all').dropna(dim='lon', how='all')
+    return dataset
+#--------------------------------------------
 
 def regrid_ISIMIP_to_obs(isimip_data: dict, obs: xr.DataArray, models: list, scenarios: list, REGRID_METHOD: str,
                           VAR_NAME: str, VAR_UNITS: str, VAR_STDNAME: str, long_name: str) -> dict:  
@@ -117,7 +133,7 @@ def regrid_ISIMIP_to_obs(isimip_data: dict, obs: xr.DataArray, models: list, sce
 
     for model in models:
         for scenario in scenarios:
-                if (model, scenario, VAR_NAME) in isimip_data:
+                if f'{model}_{scenario}_{VAR_NAME}' in isimip_data:
 
                     #change key to model_scenario_pr
                     name = f"{model}_{scenario}_{VAR_NAME}"
@@ -125,11 +141,11 @@ def regrid_ISIMIP_to_obs(isimip_data: dict, obs: xr.DataArray, models: list, sce
                     # Extract the variable
                     if VAR_NAME == 'pr':
                         # Convert precipitation flux from kg m-2 s-1 to mm/day
-                        data = isimip_data[(model, scenario, VAR_NAME)] * 86400
+                        data = isimip_data[f'{model}_{scenario}_{VAR_NAME}'] * 86400
 
                         #If temperature variables, convert from Kelvin to Celsius
                     elif VAR_NAME in ['tasmin', 'tasmax']:
-                        data = isimip_data[(model, scenario, VAR_NAME)]-273.15  
+                        data = isimip_data[f'{model}_{scenario}_{VAR_NAME}']-273.15
 
                     #regrid the data to the EOBS grid with xesmf
                     #regrid with xesmf
@@ -440,258 +456,275 @@ Notes
 ──────────────────────────────────────────────────────────────────────────────
 """
 #==========================================================================================================================
+import numpy as np
+import xarray as xr
 
 def quantile_delta_mapping(
     obs: xr.DataArray,
     sim_hist: xr.DataArray,
     sim_future: xr.DataArray,
-    *,
+    *,                          #means keyword-only arguments after this point i.e. n_quantiles=xxx not just typing xxx
     n_quantiles: int = 251,
     min_valid: int = 10,
-    kind: str = "+",  # "+" (additive, e.g., T) or "*" (multiplicative, e.g., P)
+    kind: str = "+",          # "+" (additive, e.g., T) or "*" (multiplicative, e.g., P)
+    ps_eps: float = 1e-3,     # shrink tails away from 0/1 for stability
+    eps: float = 1e-6,        # floor for multiplicative denominator
+    rmin: float = 0.2,        # min scaling factor (multiplicative)
+    rmax: float = 10.0,       # max scaling factor (multiplicative)
+    out_dtype: np.dtype = np.float32,
 ) -> tuple[xr.DataArray, xr.DataArray]:
     """
-    Dask/xarray‑native QDM (no pandas, no per‑cell Python loops).
-
-    Strategy (vectorized):
-      1) Align OBS & HIST on overlapping time for training.
-      2) Stack space = lat*lon so we operate on (time, space) matrices.
-      3) Compute per‑space quantiles:
-           q_obs(q,space), q_simh(q,space) on overlap; q_simf(q,space) on FUT.
-      4) HIST (QM): p = interp(hist, q_simh→ps); hist_bc = interp(p, ps→q_obs).
-      5) FUT (QDM): corr_q = obs_q + (simf_q - simh_q)   [additive]
-                          or obs_q * (simf_q / simh_q)   [multiplicative]
-                     p = interp(fut, simf_q→ps); fut_bc = interp(p, ps→corr_q).
-      6) Unstack back to (lat, lon, time). Works eager or with dask chunks.
-
-    Notes
-    -----
-    - If a pixel has < min_valid non‑NaN values in the training overlap,
-      its outputs are filled with NaNs.
-    - FUT must already be on the same (lat, lon) grid.
-    - Use `.chunk()` on inputs before calling to control dask performance.
+    Overlap-only QDM (vectorized, dask-friendly).
+    - Calibrates on obs×sim_hist time overlap.
+    - Returns:
+        hist_bc: QM-corrected sim_hist on overlap times
+        fut_bc : QDM-corrected sim_future on its native times
     """
-    if kind not in {"+", "*"}:
-        raise ValueError("kind must be '+' (additive) or '*' (multiplicative).")
 
-    # 1) Align training pair on overlap (inner join on time)
-    obs_aln, hist_aln = xr.align(obs, sim_hist, join="inner")
-    # Basic grid sanity
+    if kind not in {"+", "*"}:
+        raise ValueError("kind must be '+' or '*'")
+
+    # Grid sanity (expects dims named 'lat','lon')
     if not (np.array_equal(obs.lat, sim_hist.lat) and np.array_equal(obs.lon, sim_hist.lon)):
         raise ValueError("obs and sim_hist must share the same lat/lon grid.")
     if not (np.array_equal(obs.lat, sim_future.lat) and np.array_equal(obs.lon, sim_future.lon)):
         raise ValueError("sim_future must share the same lat/lon grid as obs/sim_hist.")
 
-    # 2) Stack space (keeps chunking if dask)
-    def _stack_space(da):
-        return da.transpose("time", "lat", "lon").stack(space=("lat", "lon"))
+    # 1) Align training on overlap
+    obs_aln, hist_aln = xr.align(obs, sim_hist, join="inner")
 
-    O  = _stack_space(obs_aln)       # (t_train, space)
-    Ht = _stack_space(hist_aln)      # (t_train, space)
-    F  = _stack_space(sim_future)    # (t_fut,   space)
+    # Stack/unstack helpers
+    def _stack(da): return da.transpose("time", "lat", "lon").stack(space=("lat", "lon"))
+    def _unstack(da): return da.unstack("space").transpose("time", "lat", "lon")
 
-    # Probability grid (shared across pixels)
-    ps = xr.DataArray(np.linspace(0.0, 1.0, n_quantiles), dims=["q"], name="ps")
+    O = _stack(obs_aln)            # (t_train, space)
+    Ht = _stack(hist_aln)          # (t_train, space)
+    F  = _stack(sim_future)        # (t_fut,   space)
 
-    # 3) Quantiles per space
-    # -----------------------------------------------------------------
-    # helper: nan‑aware quantile for 1D arrays
+    # 2) Probability grid (avoid exact 0/1)
+    ps = xr.DataArray(
+        np.linspace(ps_eps, 1.0 - ps_eps, n_quantiles, dtype=np.float64),
+        dims=["q"], name="ps"
+    )
+
+    # 3) Quantiles per space (nan-aware; require min_valid)
     def _nanquantile_1d(x, q):
         x = x.astype(np.float64, copy=False)
         if np.count_nonzero(~np.isnan(x)) < min_valid:
-            return np.full_like(q, np.nan, dtype=np.float64)
+            return np.full(q.shape, np.nan, dtype=np.float64)
         return np.nanquantile(x, q)
 
-    # vectorized over 'space'; core dim is 'time' → output core dim 'q'
-    q_obs  = xr.apply_ufunc(
-        _nanquantile_1d, O, ps,
-        input_core_dims=[["time"], ["q"]],
-        output_core_dims=[["q"]],
-        vectorize=True, dask="parallelized", output_dtypes=[np.float64]
-    )
-    q_simh = xr.apply_ufunc(
-        _nanquantile_1d, Ht, ps,
-        input_core_dims=[["time"], ["q"]],
-        output_core_dims=[["q"]],
-        vectorize=True, dask="parallelized", output_dtypes=[np.float64]
-    )
-    q_simf = xr.apply_ufunc(
-        _nanquantile_1d, F, ps,
-        input_core_dims=[["time"], ["q"]],
-        output_core_dims=[["q"]],
-        vectorize=True, dask="parallelized", output_dtypes=[np.float64]
-    )
+    q_obs  = xr.apply_ufunc(_nanquantile_1d, O, ps,
+                            input_core_dims=[["time"], ["q"]], output_core_dims=[["q"]],
+                            vectorize=True, dask="parallelized", output_dtypes=[np.float64])
+    q_simh = xr.apply_ufunc(_nanquantile_1d, Ht, ps,
+                            input_core_dims=[["time"], ["q"]], output_core_dims=[["q"]],
+                            vectorize=True, dask="parallelized", output_dtypes=[np.float64])
+    q_simf = xr.apply_ufunc(_nanquantile_1d, F, ps,
+                            input_core_dims=[["time"], ["q"]], output_core_dims=[["q"]],
+                            vectorize=True, dask="parallelized", output_dtypes=[np.float64])
 
-    # 4) HIST correction (standard QM)
-    # -----------------------------------------------------------------
-    # p = interp(hist_val, q_simh → ps)
-    def _interp_prob_from_quantiles(x_t, qx_q, ps_q):
-        # returns p(t); if qx_q has NaNs (insufficient training), return NaNs
-        if np.any(np.isnan(qx_q)):
-            return np.full_like(x_t, np.nan, dtype=np.float64)
+    # 3b) Enforce non-decreasing quantiles for robust interp
+    def _monotone(q):
+        if np.any(np.isnan(q)): return q
+        return np.maximum.accumulate(q)
+
+    q_obs  = xr.apply_ufunc(_monotone, q_obs,  input_core_dims=[["q"]], output_core_dims=[["q"]],
+                            vectorize=True, dask="parallelized", output_dtypes=[np.float64])
+    q_simh = xr.apply_ufunc(_monotone, q_simh, input_core_dims=[["q"]], output_core_dims=[["q"]],
+                            vectorize=True, dask="parallelized", output_dtypes=[np.float64])
+    q_simf = xr.apply_ufunc(_monotone, q_simf, input_core_dims=[["q"]], output_core_dims=[["q"]],
+                            vectorize=True, dask="parallelized", output_dtypes=[np.float64])
+
+    # 4) Interp helpers
+    def _p_from_q(x_t, qx_q, ps_q):
+        if np.any(np.isnan(qx_q)): return np.full_like(x_t, np.nan, dtype=np.float64)
         return np.interp(x_t, qx_q, ps_q, left=ps_q[0], right=ps_q[-1])
 
-    p_hist = xr.apply_ufunc(
-        _interp_prob_from_quantiles, Ht, q_simh, ps,
-        input_core_dims=[["time"], ["q"], ["q"]],
-        output_core_dims=[["time"]],
-        vectorize=True, dask="parallelized", output_dtypes=[np.float64]
-    )
-
-    # hist_bc = interp(p, ps → q_obs)
-    def _interp_value_from_prob(p_t, ps_q, qo_q):
-        if np.any(np.isnan(qo_q)):
-            return np.full_like(p_t, np.nan, dtype=np.float64)
+    def _x_from_p(p_t, ps_q, qo_q):
+        if np.any(np.isnan(qo_q)): return np.full_like(p_t, np.nan, dtype=np.float64)
         return np.interp(p_t, ps_q, qo_q)
 
-    H_bc = xr.apply_ufunc(
-        _interp_value_from_prob, p_hist, ps, q_obs,
-        input_core_dims=[["time"], ["q"], ["q"]],
-        output_core_dims=[["time"]],
-        vectorize=True, dask="parallelized", output_dtypes=[np.float64]
-    )
+    # 5) HIST (QM) on overlap only
+    p_hist = xr.apply_ufunc(_p_from_q, Ht, q_simh, ps,
+                            input_core_dims=[["time"], ["q"], ["q"]],
+                            output_core_dims=[["time"]], vectorize=True,
+                            dask="parallelized", output_dtypes=[np.float64])
 
-    # 5) FUT correction (QDM)
-    # -----------------------------------------------------------------
-    # corr_q = obs_q + (simf_q - simh_q)  [additive]
-    #        = obs_q * (simf_q / simh_q)  [multiplicative]
-    def _corr_quantiles(obs_q, simh_q, simf_q, mode, eps=0.1, rmin=0.2, rmax=10.0): #apply max sCALING factor
-        """
-        Apply QDM correction to quantiles with a max scaling factor.
-        """
+    H_bc = xr.apply_ufunc(_x_from_p, p_hist, ps, q_obs,
+                          input_core_dims=[["time"], ["q"], ["q"]],
+                          output_core_dims=[["time"]], vectorize=True,
+                          dask="parallelized", output_dtypes=[out_dtype])
+
+    # 6) FUT (QDM)
+    def _corr_quantiles(obs_q, simh_q, simf_q, mode, eps_, rmin_, rmax_):
         if np.any(np.isnan(obs_q)) or np.any(np.isnan(simh_q)) or np.any(np.isnan(simf_q)):
             return np.full_like(obs_q, np.nan, dtype=np.float64)
         if mode == "+":
             return obs_q + (simf_q - simh_q)
-        # multiplicative with floor + caps
-        simh_q_safe = np.maximum(simh_q, eps)
+        simh_q_safe = np.maximum(simh_q, eps_)
         with np.errstate(divide="ignore", invalid="ignore"):
             ratio = simf_q / simh_q_safe
-        ratio = np.clip(ratio, rmin, rmax)
+        ratio = np.clip(ratio, rmin_, rmax_)
         return obs_q * ratio
 
+    corr_q = xr.apply_ufunc(_corr_quantiles, q_obs, q_simh, q_simf,
+                            xr.DataArray(kind), xr.DataArray(eps),
+                            xr.DataArray(rmin), xr.DataArray(rmax),
+                            input_core_dims=[["q"], ["q"], ["q"], [], [], [], []],
+                            output_core_dims=[["q"]], vectorize=True,
+                            dask="parallelized", output_dtypes=[np.float64])
 
-    corr_q = xr.apply_ufunc(
-        _corr_quantiles, q_obs, q_simh, q_simf, xr.DataArray(kind),
-        input_core_dims=[["q"], ["q"], ["q"], []],
-        output_core_dims=[["q"]],
-        vectorize=True, dask="parallelized", output_dtypes=[np.float64]
-    )
+    p_fut = xr.apply_ufunc(_p_from_q, F, q_simf, ps,
+                           input_core_dims=[["time"], ["q"], ["q"]],
+                           output_core_dims=[["time"]], vectorize=True,
+                           dask="parallelized", output_dtypes=[np.float64])
 
-    # p for FUT with its own CDF: p = interp(fut_val, q_simf → ps)
-    p_fut = xr.apply_ufunc(
-        _interp_prob_from_quantiles, F, q_simf, ps,
-        input_core_dims=[["time"], ["q"], ["q"]],
-        output_core_dims=[["time"]],
-        vectorize=True, dask="parallelized", output_dtypes=[np.float64]
-    )
+    F_bc = xr.apply_ufunc(_x_from_p, p_fut, ps, corr_q,
+                          input_core_dims=[["time"], ["q"], ["q"]],
+                          output_core_dims=[["time"]], vectorize=True,
+                          dask="parallelized", output_dtypes=[out_dtype])
 
-    # fut_bc = interp(p_fut, ps → corr_q)
-    F_bc = xr.apply_ufunc(
-        _interp_value_from_prob, p_fut, ps, corr_q,
-        input_core_dims=[["time"], ["q"], ["q"]],
-        output_core_dims=[["time"]],
-        vectorize=True, dask="parallelized", output_dtypes=[np.float64]
-    )
+    # 7) Unstack & name; set coords
+    hist_bc = _unstack(H_bc).assign_coords(time=hist_aln.time).rename("hist_qdm")
+    fut_bc  = _unstack(F_bc).assign_coords(time=sim_future.time).rename("future_qdm")
 
-    # 6) Unstack back to (lat, lon, time)
-    hist_bc = H_bc.unstack("space").transpose("time", "lat", "lon")
-    fut_bc  = F_bc.unstack("space").transpose("time", "lat", "lon")
-
-    # Name/attrs
-    hist_bc = hist_bc.assign_coords(time=sim_hist.time).rename("hist_qdm")
-    fut_bc  = fut_bc.assign_coords(time=sim_future.time).rename("future_qdm")
-    # Optional: carry units
+    # Carry units if present
     if "units" in getattr(obs, "attrs", {}):
         hist_bc.attrs.setdefault("units", obs.attrs["units"])
-        fut_bc .attrs.setdefault("units",  obs.attrs["units"])
+        fut_bc .attrs.setdefault("units", obs.attrs["units"])
 
     return hist_bc, fut_bc
+
 #==========================================================================================================================
 
 ### bias correct the regridded data
+### bias correct the regridded data
 def bias_correct_ISIMIP(isimip_regridded: dict, obs: xr.DataArray, models: list, 
-                        future_scenarios: list, method: str, kind="*",
-                         VAR_NAME='pr', VAR_UNITS="mm/day", VAR_STDNAME="precipitation_flux", REGRID_METHOD="bilinear"):
+                        future_scenarios: list, method: str,
+                        VAR_NAME, VAR_UNITS, VAR_STDNAME, kind):
     """
-    Bias correct the regridded ISIMIP data using Empirical Quantile Mapping.
-    
-    Parameters:
-    model_scenario_combos (dict): Dictionary with model-scenario combinations and regridded data.
-    obs (xarray.DataArray): EOBS dataset to bias correct against.
-    models (list): List of ISIMIP model names.
-    scenarios (list): List of scenario names.
-    method (str): Bias correction method, either 'qdm' for Quantile Delta Mapping or 'eqm' for Empirical Quantile Mapping.
-    kind (str): Kind of interpolation to use ("+": additive for temperature or "*": multiplicative for precipitation), default is "*".
-    
-    Returns:
-    dict: Dictionary with bias-corrected data for each model-scenario combination.
+    Bias-correct regridded ISIMIP data using QDM or EQM (overlap-only training).
+    Returns a dict with bias-corrected historical and future DataArrays per model/scenario.
     """
-    
-    # Create a dictionary to store the bias-corrected data
-    model_scenario_combos_bc = {}
+    method_norm = method.lower()
+    if method_norm not in {"qdm", "eqm"}:
+        raise ValueError("Method must be 'QDM' or 'EQM'.")
+
+    # dict to hold output DataArrays
+    out = {}
 
     for model in models:
-            # extract historical and future data for the model
-        hist_data = isimip_regridded.get(f"{model}_historical_{VAR_NAME}")[VAR_NAME]
-
-        if hist_data is None: 
-            print(f"[skip] missing {model} historical"); 
+        key_hist = f"{model}_historical_{VAR_NAME}"
+        hist_entry = isimip_regridded.get(key_hist)
+        if hist_entry is None or VAR_NAME not in hist_entry:
+            print(f"[skip] missing {key_hist}")
             continue
+        hist_data = hist_entry[VAR_NAME]
+
+        # crop obs once per model
+        obs_sub = obs.sel(lat=slice(hist_data.lat.max(), hist_data.lat.min()),
+                          lon=slice(hist_data.lon.min(), hist_data.lon.max()))
 
         for future in future_scenarios:
-
-            fut_data = isimip_regridded.get(f"{model}_{future}_{VAR_NAME}")[VAR_NAME]
-
-            if fut_data is None: 
-                print(f"[skip] missing {model} {future}"); 
+            key_fut = f"{model}_{future}_{VAR_NAME}"
+            fut_entry = isimip_regridded.get(key_fut)
+            if fut_entry is None or VAR_NAME not in fut_entry:
+                print(f"[skip] missing {key_fut}")
                 continue
-        #set obs to same extent as ISIMIP data
-            obs = obs.sel(lat=slice(hist_data.lat.max(), hist_data.lat.min()),
-                         lon=slice(hist_data.lon.min(), hist_data.lon.max()))
+            fut_data = fut_entry[VAR_NAME]
 
-            if method == 'qdm':
-                # Apply QDM bias correction
-                hist_pr_bc, fut_pr_bc = quantile_delta_mapping(obs, hist_data, fut_data, n_quantiles=251, min_valid=10, kind=kind)
+            # (optional but helpful) ensure same grid between hist and fut
+            if not (np.array_equal(hist_data.lat, fut_data.lat) and np.array_equal(hist_data.lon, fut_data.lon)):
+                raise ValueError(f"{model} {future}: future grid != historical grid after regridding.")
 
-            elif method == 'eqm':
-                # Apply EQM bias correction
-                hist_pr_bc, fut_pr_bc = empirical_quantile_mapping(obs, hist_data, fut_data, n_q=51, min_samples=10)
+            if method_norm == "qdm":
+                hist_bc, fut_bc = quantile_delta_mapping(
+                    obs_sub, hist_data, fut_data, n_quantiles=251, min_valid=10, kind=kind
+                )
+            else:  # eqm
+                hist_bc, fut_bc = empirical_quantile_mapping(
+                    obs_sub, hist_data, fut_data, n_q=51, min_samples=10
+                )
+
+            long_name = f"{method_norm.upper()} bias-corrected {VAR_NAME}"
+
+            # variable-level attributes
+            var_attrs = {
+                "units": VAR_UNITS,
+                "standard_name": VAR_STDNAME,
+                "long_name": long_name,
+            }
+
+            # dataset-level attributes
+            hist_attrs = {
+                "source": f"{model} ISIMIP3b",
+                "source_scenario": "historical",
+                "bias_correction_method": method_norm.upper()
+                
+            }
+            fut_attrs = {
+                "source": f"{model} ISIMIP3b",
+                "source_scenario": future,
+                "bias_correction_method": method_norm.upper()
+                
+            }
+
+            # build datasets
+            hist_ds = xr.Dataset({VAR_NAME: hist_bc.astype(np.float32)})
+            hist_ds[VAR_NAME].attrs = var_attrs
+            hist_ds.attrs.update(hist_attrs)
+
+            fut_ds = xr.Dataset({VAR_NAME: fut_bc.astype(np.float32)})
+            fut_ds[VAR_NAME].attrs = var_attrs
+            fut_ds.attrs.update(fut_attrs)
+
+            # save datasets to results dict
+            out[f"{model}_historical_{VAR_NAME}"] = hist_ds
+            out[f"{model}_{future}_{VAR_NAME}"]   = fut_ds
+
+    return out
+
+#==========================================================================================================================
+
+
+#====Export  bias corrected data to NetCDF
+
+def export_scenarios_to_netcdf(isimip_dict, dest_isimip: str, export_scenarios: list,
+                               models: list, variable: str, method: str) -> None:
+    """
+    Export the bias-corrected ISIMIP data to NetCDF files, safely handling file locks on Windows.
+    """
+    
+    for model in models:
+        for scenario in export_scenarios:
+            if variable == 'pre':
+                data = isimip_dict[f'{model}_{scenario}_{method}']
+            elif variable in ['tasmin', 'tasmax', 'tavg']:
+                data = isimip_dict[f'{model}_{scenario}_{variable}']
             else:
-                raise ValueError("Method must be either 'QDM' or 'EQM'.")
+                continue
 
+            # Load fully into memory to detach from any open NetCDF source
+            data = data.load()
 
-            hist_attrs = dict(
-                    units=VAR_UNITS,
-                    standard_name=VAR_STDNAME,
-                    long_name="Regridded precipitation rate",
-                    source_model=model,
-                    source_scenario='historical',
-                    bias_correction_method=method,
-                    regrid_method=REGRID_METHOD,
-                    source="ISIMIP3b"
-        )
-            
+            # Ensure target folder exists
+            out_dir = os.path.join(dest_isimip, model, scenario)
+            os.makedirs(out_dir, exist_ok=True)
+            out_file = os.path.join(out_dir, f"{model}_{variable}_highres.nc")
 
-            fut_attrs = dict(
-                    units=VAR_UNITS,
-                    standard_name=VAR_STDNAME,
-                    long_name="Regridded precipitation rate",
-                    source_model=model,
-                    source_scenario=future,
-                    bias_correction_method=method,
-                    regrid_method=REGRID_METHOD,
-                    source="ISIMIP3b"
-        )
-            
-            # Assign attributes to the bias-corrected data
-            hist_pr_bc = hist_pr_bc.assign_attrs(**hist_attrs)
-            fut_pr_bc = fut_pr_bc.assign_attrs(**fut_attrs)
+            # Temp file for atomic write
+            tmp_file = os.path.join(out_dir, f".tmp_{uuid.uuid4().hex}.nc")
 
-
-            # Add the bias-corrected data to the dictionary
-            model_scenario_combos_bc[f"{model}_historical_{method}"] = hist_pr_bc
-            model_scenario_combos_bc[f"{model}_{future}_{method}"] = fut_pr_bc
-
-
-    return model_scenario_combos_bc
+            # Try a few times in case file is locked
+            for attempt in range(5):
+                try:
+                    data.to_netcdf(tmp_file, mode='w', format='NETCDF4')
+                    gc.collect()
+                    os.replace(tmp_file, out_file)  # Atomic replace
+                    break
+                except PermissionError:
+                    time.sleep(0.6 * (attempt + 1))
+            else:
+                raise PermissionError(f"Could not write file {out_file}. "
+                                      f"Ensure no other program has it open.")
