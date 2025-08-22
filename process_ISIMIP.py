@@ -599,7 +599,6 @@ def quantile_delta_mapping(
 #==========================================================================================================================
 
 ### bias correct the regridded data
-### bias correct the regridded data
 def bias_correct_ISIMIP(isimip_regridded: dict, obs: xr.DataArray, models: list, 
                         future_scenarios: list, method: str,
                         VAR_NAME, VAR_UNITS, VAR_STDNAME, kind):
@@ -691,27 +690,20 @@ def bias_correct_ISIMIP(isimip_regridded: dict, obs: xr.DataArray, models: list,
 #====Export  bias corrected data to NetCDF
 
 def export_scenarios_to_netcdf(isimip_dict, dest_isimip: str, export_scenarios: list,
-                               models: list, variable: str, method: str) -> None:
+                               models: list, variable: str) -> None:
     """
     Export the bias-corrected ISIMIP data to NetCDF files, safely handling file locks on Windows.
     """
     
     for model in models:
         for scenario in export_scenarios:
-            if variable == 'pre':
-                data = isimip_dict[f'{model}_{scenario}_{method}']
-            elif variable in ['tasmin', 'tasmax', 'tavg']:
-                data = isimip_dict[f'{model}_{scenario}_{variable}']
-            else:
-                continue
-
+            data = isimip_dict[f'{model}_{scenario}_{variable}']
             # Load fully into memory to detach from any open NetCDF source
             data = data.load()
-
             # Ensure target folder exists
             out_dir = os.path.join(dest_isimip, model, scenario)
             os.makedirs(out_dir, exist_ok=True)
-            out_file = os.path.join(out_dir, f"{model}_{variable}_highres.nc")
+            out_file = os.path.join(out_dir, f"{model}_{variable}.nc")
 
             # Temp file for atomic write
             tmp_file = os.path.join(out_dir, f".tmp_{uuid.uuid4().hex}.nc")
@@ -727,4 +719,4 @@ def export_scenarios_to_netcdf(isimip_dict, dest_isimip: str, export_scenarios: 
                     time.sleep(0.6 * (attempt + 1))
             else:
                 raise PermissionError(f"Could not write file {out_file}. "
-                                      f"Ensure no other program has it open.")
+                                        f"Ensure no other program has it open.")
