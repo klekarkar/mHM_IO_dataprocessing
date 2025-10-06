@@ -1,5 +1,6 @@
 #THese scripts are for validating mHM flow and baseflow for seasonal recharge analysis
 """Python py_geospatial environment"""
+import sys
 import xarray as xr
 import numpy as np
 import pandas as pd
@@ -11,9 +12,10 @@ from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
 import os
 import process_observed_discharge as mQ
 import glob
-import pickle
 from sklearn.metrics import r2_score
 import baseflow #this is the baseflow package
+import sys
+from pathlib import Path
 
 #segoe UI
 plt.rcParams['font.family'] = 'Segoe UI'
@@ -264,56 +266,66 @@ def seasonal_Q_comparison(base_sim_dir, sim_subfolder, models, eval_Obs, season_
 
 #==================================================
 
+from pathlib import Path
+import sys
+
 def extract_multistation_baseflow(base_sim_dir, sim_subfolder, models, eval_Obs):
     """  
     Extract baseflow time series for each station and model using the best method based on observed data.  
     Parameters  
     ----------
-    base_sim_dir : str  
-        Base directory containing model subdirectories.  
-    sim_subfolder : str  
-        Subfolder within each model directory containing simulation CSV files.  
-    models : list of str  
-        List of model names corresponding to subdirectory names.  
+    base_sim_dir : str
+        Base directory containing model subdirectories.
+    sim_subfolder : str
+        Subfolder within each model directory containing simulation CSV files.
+    models : list of str
+        List of model names corresponding to subdirectory names.
     eval_Obs : dict  
         Dictionary of observed discharge time series (keyed by station name).    
     Returns  
     -------
     dict of pd.DataFrame  
-        Dictionary with model names as keys and DataFrames with baseflow time series as values.  
+        Dictionary with model names as keys and DataFrames with baseflow time series as values.
     """
-
-    all_models_Qb = {}
-
+    # Ensure station names are uppercase for consistency
     eval_Obs_upper = keys_upper(eval_Obs)
 
+    all_models_Qb = {}
+    all_models_BFI = {}
+
     for model in models:
-        sim_files = glob.glob(f"{base_sim_dir}/{model}/{sim_subfolder}/*.csv")
-        stations_Qb = []  # <-- collect per model
+        sim_dir = Path(base_sim_dir) / model / sim_subfolder
+        stations_Qb = []
+        stations_BFI = []
 
-        for fpath in sim_files:
-            station_name = os.path.splitext(os.path.basename(fpath))[0]
+        for fpath in sorted(sim_dir.glob("*.csv")):
+            station_name = fpath.stem.upper()
 
-            #match cases
-            station_name = station_name.upper()
+            if station_name not in eval_Obs_upper:
+                #extract baseflow
+                msg = f"Extracting baseflow for {station_name}"
+                sys.stdout.write("\r" + msg + "  " * 20)
+                sys.stdout.flush()
+                continue
 
-            if station_name in eval_Obs_upper:
-
-                obs_Q = eval_Obs_upper[station_name]
-                #set index to datetime if not already
-                if not isinstance(obs_Q.index, pd.DatetimeIndex):
-                    obs_Q.index = pd.to_datetime(obs_Q.index)
-
+            obs_Q = eval_Obs_upper[station_name]
+            #set index to datetime if not already
+            if not isinstance(obs_Q.index, pd.DatetimeIndex):
+                obs_Q.index = pd.to_datetime(obs_Q.index)
             sim_Q = pd.read_csv(fpath, index_col=0, parse_dates=True)
 
+            #merge on index
             q_merged = match_frequency_and_resample(sim_Q, obs_Q, 'D','D', station_name)
 
             if q_merged.empty:
-                print(f"Station {station_name}: No overlapping data after resampling.", end="\r")
                 continue
-
+            
             #extract baseflow
-            print(f"Extracting baseflow using multiple for {station_name}", end='\x1b[1K\r')
+            msg = f"Extracting baseflow for {station_name}"
+            sys.stdout.write("\r" + msg + "  " * 20)
+            sys.stdout.flush()
+
+            #extract baseflow using multiple methods and select best based on KGE
             obs_bf_dict, obs_bfi, obs_kge = baseflow.separation(q_merged[["q_obs"]], return_bfi=True, return_kge=True)
 
             #select the best method based on KGE
@@ -321,23 +333,44 @@ def extract_multistation_baseflow(base_sim_dir, sim_subfolder, models, eval_Obs)
 
             #extract the baseflow timeseries for the best method
             obs_Qb = obs_bf_dict[best_method]
+            obs_bfi = obs_bfi[best_method]
 
             #use the same best method to extract the baseflow from the simulated Q
-            sim_bf_dict, sim_bfi, sim_df_kge = baseflow.separation(q_merged[['q_model']], return_bfi=True, return_kge=True, method=best_method)
+            sim_bf_dict, sim_bfi = baseflow.separation(q_merged[['q_model']], return_bfi=True, return_kge=False, method=best_method)
             sim_Qb= sim_bf_dict[best_method]
+            sim_bfi = sim_bfi[best_method]
 
-            #concatenate the results
-            station_Qb = pd.concat([obs_Qb, sim_Qb], axis=1)
-            station_Qb['station'] = station_name
-            station_Qb.columns = ['obs_Qb', 'sim_Qb', 'station']
-            stations_Qb.append(station_Qb)
+            #combine into a dataframe
+            bf_df = pd.concat([obs_Qb, sim_Qb], axis=1)
+            bf_df.columns = ['obs_Qb', 'sim_Qb']
+            bf_df['station'] = station_name
+            
+            #rearrange columns
+            bf_df=bf_df[["station", 'obs_Qb', 'sim_Qb']]
+            stations_Qb.append(bf_df)
+
+            #bfi data
+            bfi_df=pd.DataFrame({"obs_bfi":obs_bfi.values, "sim_bfi":sim_bfi.values})
+            bfi_df['name'] = station_name
+            bfi_df['model'] = model
+
+            bfi_df=bfi_df[["name","obs_bfi","sim_bfi", "model"]]
+            stations_BFI.append(bfi_df)
+
+
+        if stations_Qb:
+            model_bf_df = pd.concat(stations_Qb)
+            model_bf_df['model'] = model
+            all_models_Qb[model] = model_bf_df
         
-        if stations_Qb:  # <-- use the correct list
-            model_Qb_df = pd.concat(stations_Qb)
-            model_Qb_df['model'] = model
-            all_models_Qb[model] = model_Qb_df
+        if stations_BFI:
+            model_bfi_df = pd.concat(stations_BFI)
+            model_bfi_df['model'] = model
+            # Optionally store BFI data if needed
+            all_models_BFI[model] = model_bfi_df
 
-    return all_models_Qb
+    return all_models_Qb, all_models_BFI
+
 
 #==================================================
 def seasonal_baseflow_analysis(all_models_Qb, models, season_map):
