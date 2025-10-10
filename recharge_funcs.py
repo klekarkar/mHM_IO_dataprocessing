@@ -781,7 +781,7 @@ def map_BFI_anomalies(bfi_gdf, boundaries_shp, streams_shp, m_diff, p_w):
         edgecolor = 'gray'
         lwidth = 0.4
         plt.setp(p, "edgecolor", edgecolor, "linewidth", lwidth)
-    ax_in.set_xlabel('BFI difference', fontsize=9)
+    ax_in.set_xlabel(r'$BFI_{sim} - BFI_{obs}$', fontsize=9)
     ax_in.set_ylabel('Stations', fontsize=9)
     ax_in.tick_params(labelsize=9)
 

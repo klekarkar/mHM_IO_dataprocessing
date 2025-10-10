@@ -1,0 +1,14 @@
+<PAMDataset>
+  <Subdataset name="recharge">
+    <PAMDataset>
+      <PAMRasterBand band="1">
+        <Metadata>
+          <MDI key="STATISTICS_MAXIMUM">360.41893242368</MDI>
+          <MDI key="STATISTICS_MEAN">130.48357531327</MDI>
+          <MDI key="STATISTICS_MINIMUM">3.9268110838484e-61</MDI>
+          <MDI key="STATISTICS_STDDEV">55.221607473948</MDI>
+        </Metadata>
+      </PAMRasterBand>
+    </PAMDataset>
+  </Subdataset>
+</PAMDataset>
